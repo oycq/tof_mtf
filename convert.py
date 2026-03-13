@@ -9,8 +9,8 @@ RAW_ROWS = 31
 RAW_COLS = 40
 RAW_BINS = 64
 TOTAL_COUNT = RAW_ROWS * RAW_COLS * RAW_BINS
-K = 4
-OUTPUT_FORMAT = "bmp"  # 可选: "pgm" / "bmp" / "png"
+K = 2
+OUTPUT_FORMAT = "pgm"  # 可选: "pgm" / "bmp" / "png"
 
 
 def convert_one(raw_file, out_dir, output_format):
