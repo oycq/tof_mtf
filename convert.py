@@ -9,7 +9,7 @@ RAW_ROWS = 31
 RAW_COLS = 40
 RAW_BINS = 64
 TOTAL_COUNT = RAW_ROWS * RAW_COLS * RAW_BINS
-K = 2
+K = 2500.0
 OUTPUT_FORMAT = "pgm"  # 可选: "pgm" / "bmp" / "png"
 
 
@@ -19,13 +19,14 @@ def convert_one(raw_file, out_dir, output_format):
         print("跳过(长度不对):", raw_file, "实际:", data.size, "期望:", TOTAL_COUNT)
         return
 
-    data = data.reshape(RAW_ROWS, RAW_COLS, RAW_BINS)
+    data = data.reshape(RAW_ROWS, RAW_COLS, RAW_BINS).astype(np.float32)
 
-    # 第一行不要，只要后 30 行；64bin 中只要前 62 个
-    data = data[1:, :, :62]  # 形状: (30, 40, 62)
+    hist = data[1:, :, :62]
+    sat = data[1:, :, 62] * 1024 + data[1:, :, 63]
+    data = hist * 50000 / sat[:, :, None]
 
-    # 亮度: 62bin 均值 /1024 *255 *K，转 8bit
-    img = data.mean(axis=2) / 1024.0 * 255.0 * K
+
+    img = data.mean(axis=2) / K * 255.0
     img = np.clip(img, 0, 255).astype(np.uint8)  # 形状: (30, 40)
 
     name = os.path.splitext(os.path.basename(raw_file))[0]
