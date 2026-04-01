@@ -1,4 +1,3 @@
-import argparse
 import cv2
 import numpy as np
 
@@ -7,6 +6,16 @@ BOTTOM_MM = 300.0
 H_MM = 240.0
 TOP_MM = BOTTOM_MM - H_MM * np.tan(np.deg2rad(10.0))
 HFOV_DEG = 52.0
+DEFAULT_INPUT_PATH = "tof.pgm"
+
+# Tilt thresholds ("macro-like" constants):
+# 1) all angles use one symmetric threshold (+/- deg)
+# 2) X/Y use one symmetric threshold (+/- mm)
+# 3) Z uses [min, max] range (mm)
+ANGLE_ABS_DEG_MAX = 5.0
+XY_ABS_MM_MAX = 20.0
+Z_MM_MIN = 400.0
+Z_MM_MAX = 500.0
 
 
 def to_gray_float(image: np.ndarray) -> np.ndarray:
@@ -212,6 +221,66 @@ def solve_pose(results, width: int, height: int):
     }
 
 
+def check_tilt_and_extract_values(
+    gray_f32: np.ndarray,
+    angle_abs_deg_max: float = ANGLE_ABS_DEG_MAX,
+    xy_abs_mm_max: float = XY_ABS_MM_MAX,
+    z_mm_min: float = Z_MM_MIN,
+    z_mm_max: float = Z_MM_MAX,
+):
+    """
+    Check whether pose passes tilt/offset thresholds.
+    Returns:
+        passed (bool),
+        roll_deg, pitch_deg, yaw_deg, tx_mm, ty_mm, tz_mm
+    """
+    results = detect_strongest_corners_per_region(gray_f32)
+    pose = solve_pose(results, gray_f32.shape[1], gray_f32.shape[0])
+    if pose is None:
+        return False, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan
+
+    roll_deg = float(pose["roll_deg"])
+    pitch_deg = float(pose["pitch_deg"])
+    yaw_deg = float(pose["yaw_deg"])
+    tx_mm = float(pose["tx_mm"])
+    ty_mm = float(pose["ty_mm"])
+    tz_mm = float(pose["tz_mm"])
+
+    passed = (
+        abs(roll_deg) <= angle_abs_deg_max
+        and abs(pitch_deg) <= angle_abs_deg_max
+        and abs(yaw_deg) <= angle_abs_deg_max
+        and abs(tx_mm) <= xy_abs_mm_max
+        and abs(ty_mm) <= xy_abs_mm_max
+        and z_mm_min <= tz_mm <= z_mm_max
+    )
+    return passed, roll_deg, pitch_deg, yaw_deg, tx_mm, ty_mm, tz_mm
+
+
+def run_tilt_check():
+    """
+    No-input wrapper function.
+    Returns:
+        passed (bool), pose_values (list[float])
+        pose_values = [roll_deg, pitch_deg, yaw_deg, tx_mm, ty_mm, tz_mm]
+    """
+    img = cv2.imread(DEFAULT_INPUT_PATH, cv2.IMREAD_UNCHANGED)
+    gray_f32 = to_gray_float(img)
+    gray_up, scale_x, scale_y = upscale_to_300x400(gray_f32)
+    vis = build_display_image(gray_up)
+
+    results = detect_strongest_corners_per_region(gray_f32)
+    draw_results(vis, results, scale_x, scale_y)
+    pose = solve_pose(results, gray_f32.shape[1], gray_f32.shape[0])
+    passed, roll_deg, pitch_deg, yaw_deg, tx_mm, ty_mm, tz_mm = check_tilt_and_extract_values(
+        gray_f32
+    )
+    display = compose_display_with_header(vis, pose)
+    cv2.imwrite("tilt.bmp", display)
+    pose_values = [roll_deg, pitch_deg, yaw_deg, tx_mm, ty_mm, tz_mm]
+    return passed, pose_values
+
+
 def compose_display_with_header(vis: np.ndarray, pose):
     axis_lines = [
         "roll: around +X",
@@ -324,41 +393,11 @@ def compose_display_with_header(vis: np.ndarray, pose):
     return np.vstack([header, vis])
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input", default="tof.pgm", help="Input PGM path")
-    args = parser.parse_args()
-
-    img = cv2.imread(args.input, cv2.IMREAD_UNCHANGED)
-    gray_f32 = to_gray_float(img)
-    gray_up, scale_x, scale_y = upscale_to_300x400(gray_f32)
-    vis = build_display_image(gray_up)
-
-    results = detect_strongest_corners_per_region(gray_f32)
-    draw_results(vis, results, scale_x, scale_y)
-    pose = solve_pose(results, gray_f32.shape[1], gray_f32.shape[0])
-
-    if pose is None:
-        print("PnP failed: need 4 valid corners.")
-    else:
-        print(
-            "Rotation(deg) "
-            f"roll={pose['roll_deg']:.2f}, "
-            f"pitch={pose['pitch_deg']:.2f}, "
-            f"yaw={pose['yaw_deg']:.2f}"
-        )
-        print(
-            "Translation(mm) "
-            f"x={pose['tx_mm']:.2f}, "
-            f"y={pose['ty_mm']:.2f}, "
-            f"z={pose['tz_mm']:.2f}, "
-            f"|t|={pose['distance_mm']:.2f}"
-        )
-    display = compose_display_with_header(vis, pose)
-    cv2.imshow("TOF Corners (Upscaled + GFTT + SubPix 3x3)", display)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
-
-
 if __name__ == "__main__":
-    main()
+    passed, pose_values = run_tilt_check()
+    roll_deg, pitch_deg, yaw_deg, tx_mm, ty_mm, tz_mm = pose_values
+    print(f"passed={passed}")
+    print(
+        f"roll={roll_deg:.2f}, pitch={pitch_deg:.2f}, yaw={yaw_deg:.2f}, "
+        f"tx={tx_mm:.2f}, ty={ty_mm:.2f}, tz={tz_mm:.2f}"
+    )
