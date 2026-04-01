@@ -1,4 +1,3 @@
-bmp
-pgm
-mtf_output
+input.raw
+output.bmp
 __pycache__
