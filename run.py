@@ -404,6 +404,11 @@ class TiltChecker:
 
     def _compose_display_with_header(self, vis, pose):
         # header 上展示关键姿态值 + 坐标方向示意，便于定位异常轴。
+        threshold_lines = [
+            f"angle_limit: [{-self.angle_abs_deg_max:.1f}, {self.angle_abs_deg_max:.1f}]",
+            f"xy_limit   : [{-self.xy_abs_mm_max:.1f}, {self.xy_abs_mm_max:.1f}]",
+            f"z_range    : [{int(self.z_mm_min)}, {int(self.z_mm_max)}]",
+        ]
         axis_lines = [
             "roll: around +X",
             "pitch: around +Y",
@@ -418,32 +423,50 @@ class TiltChecker:
                 "ty_mm    :      nan",
                 "tz_mm    :      nan",
             ]
+            value_colors = [(255, 255, 255)] * len(value_lines)
         else:
+            roll = pose["roll_deg"]
+            pitch = pose["pitch_deg"]
+            yaw = pose["yaw_deg"]
+            tx = pose["tx_mm"]
+            ty = pose["ty_mm"]
+            tz = pose["tz_mm"]
             value_lines = [
-                f"{'roll_deg':<8}: {pose['roll_deg']:>8.2f}",
-                f"{'pitch_deg':<8}: {pose['pitch_deg']:>8.2f}",
-                f"{'yaw_deg':<8}: {pose['yaw_deg']:>8.2f}",
-                f"{'tx_mm':<8}: {pose['tx_mm']:>8.2f}",
-                f"{'ty_mm':<8}: {pose['ty_mm']:>8.2f}",
-                f"{'tz_mm':<8}: {pose['tz_mm']:>8.2f}",
+                f"{'roll_deg':<8}: {roll:>8.2f}",
+                f"{'pitch_deg':<8}: {pitch:>8.2f}",
+                f"{'yaw_deg':<8}: {yaw:>8.2f}",
+                f"{'tx_mm':<8}: {tx:>8.2f}",
+                f"{'ty_mm':<8}: {ty:>8.2f}",
+                f"{'tz_mm':<8}: {tz:>8.2f}",
+            ]
+            def _color(ok):
+                return (255, 255, 255) if ok else (0, 0, 255)
+            value_colors = [
+                _color(abs(roll) <= self.angle_abs_deg_max),
+                _color(abs(pitch) <= self.angle_abs_deg_max),
+                _color(abs(yaw) <= self.angle_abs_deg_max),
+                _color(abs(tx) <= self.xy_abs_mm_max),
+                _color(abs(ty) <= self.xy_abs_mm_max),
+                _color(self.z_mm_min <= tz <= self.z_mm_max),
             ]
 
-        lines = value_lines + axis_lines
+        lines = value_lines + threshold_lines + axis_lines
+        line_colors = value_colors + [(255, 255, 255)] * (len(threshold_lines) + len(axis_lines))
         line_h = 20
         top_pad = 8
         bottom_pad = 8
-        header_h = max(top_pad + len(lines) * line_h + bottom_pad, 210)
+        header_h = max(top_pad + len(lines) * line_h + bottom_pad, 260)
         header = np.zeros((header_h, vis.shape[1], 3), dtype=np.uint8)
 
         y = top_pad + 14
-        for line in lines:
+        for idx, line in enumerate(lines):
             cv2.putText(
                 header,
                 line,
                 (8, y),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.52,
-                (255, 255, 255),
+                line_colors[idx],
                 1,
                 cv2.LINE_AA,
             )
