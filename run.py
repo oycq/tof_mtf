@@ -311,9 +311,14 @@ def _check_tilt_and_extract_values(
     z_mm_max=Z_MM_MAX,
 ):
     results = _detect_strongest_corners_per_region(gray_f32)
+    nan_values = [np.nan, np.nan, np.nan, np.nan, np.nan, np.nan]
+    detected_points = sum(1 for _n, _r, _i, p in results if p is not None)
+    if detected_points < 4:
+        return False, nan_values, f"tilt corner extraction failed: need 4 points, got {detected_points}"
+
     pose = _solve_pose(results, gray_f32.shape[1], gray_f32.shape[0])
     if pose is None:
-        return False, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan
+        return False, nan_values, "tilt pnp failed"
 
     roll_deg = float(pose["roll_deg"])
     pitch_deg = float(pose["pitch_deg"])
@@ -330,7 +335,36 @@ def _check_tilt_and_extract_values(
         and abs(ty_mm) <= xy_abs_mm_max
         and z_mm_min <= tz_mm <= z_mm_max
     )
-    return passed, roll_deg, pitch_deg, yaw_deg, tx_mm, ty_mm, tz_mm
+    if passed:
+        reason = "GOOD"
+    else:
+        fail_reasons = []
+        if abs(roll_deg) > angle_abs_deg_max:
+            fail_reasons.append(
+                f"roll out of range: {roll_deg:.2f} (limit +/-{angle_abs_deg_max:.2f})"
+            )
+        if abs(pitch_deg) > angle_abs_deg_max:
+            fail_reasons.append(
+                f"pitch out of range: {pitch_deg:.2f} (limit +/-{angle_abs_deg_max:.2f})"
+            )
+        if abs(yaw_deg) > angle_abs_deg_max:
+            fail_reasons.append(
+                f"yaw out of range: {yaw_deg:.2f} (limit +/-{angle_abs_deg_max:.2f})"
+            )
+        if abs(tx_mm) > xy_abs_mm_max:
+            fail_reasons.append(
+                f"tx out of range: {tx_mm:.2f} (limit +/-{xy_abs_mm_max:.2f})"
+            )
+        if abs(ty_mm) > xy_abs_mm_max:
+            fail_reasons.append(
+                f"ty out of range: {ty_mm:.2f} (limit +/-{xy_abs_mm_max:.2f})"
+            )
+        if not (z_mm_min <= tz_mm <= z_mm_max):
+            fail_reasons.append(
+                f"tz out of range: {tz_mm:.2f} (limit [{z_mm_min:.2f}, {z_mm_max:.2f}])"
+            )
+        reason = "; ".join(fail_reasons) if fail_reasons else "tilt check failed"
+    return passed, [roll_deg, pitch_deg, yaw_deg, tx_mm, ty_mm, tz_mm], reason
 
 
 def _compose_display_with_header(vis, pose):
@@ -444,24 +478,42 @@ def _compose_display_with_header(vis, pose):
 
 
 def _run_tilt_from_pgm(pgm_path, tilt_output_path):
-    img = cv2.imread(pgm_path, cv2.IMREAD_UNCHANGED)
-    gray_f32 = _to_gray_float(img)
-    gray_up, scale_x, scale_y = _upscale_to_300x400(gray_f32)
-    vis = _build_display_image(gray_up)
+    try:
+        img = cv2.imread(pgm_path, cv2.IMREAD_UNCHANGED)
+        gray_f32 = _to_gray_float(img)
+        gray_up, scale_x, scale_y = _upscale_to_300x400(gray_f32)
+        vis = _build_display_image(gray_up)
 
-    results = _detect_strongest_corners_per_region(gray_f32)
-    _draw_results(vis, results, scale_x, scale_y)
-    pose = _solve_pose(results, gray_f32.shape[1], gray_f32.shape[0])
-    passed, roll_deg, pitch_deg, yaw_deg, tx_mm, ty_mm, tz_mm = _check_tilt_and_extract_values(
-        gray_f32
-    )
-    display = _compose_display_with_header(vis, pose)
+        results = _detect_strongest_corners_per_region(gray_f32)
+        _draw_results(vis, results, scale_x, scale_y)
+        pose = _solve_pose(results, gray_f32.shape[1], gray_f32.shape[0])
+        passed, tilt_values, tilt_reason = _check_tilt_and_extract_values(gray_f32)
+        display = _compose_display_with_header(vis, pose)
 
-    ok = cv2.imwrite(tilt_output_path, display)
-    if not ok:
-        raise RuntimeError(f"写入倾斜结果图失败: {tilt_output_path}")
+        ok = cv2.imwrite(tilt_output_path, display)
+        if not ok:
+            raise RuntimeError(f"写入倾斜结果图失败: {tilt_output_path}")
 
-    return passed, [roll_deg, pitch_deg, yaw_deg, tx_mm, ty_mm, tz_mm], display
+        return passed, tilt_values, display, tilt_reason
+    except Exception as e:
+        fallback = np.zeros((300, 400, 3), dtype=np.uint8)
+        cv2.putText(
+            fallback,
+            "tilt failed",
+            (20, 150),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.0,
+            (0, 0, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.imwrite(tilt_output_path, fallback)
+        return (
+            False,
+            [np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+            fallback,
+            f"tilt exception: {e}",
+        )
 
 
 def run_all_checks(tof_raw_path, tmp_dir="tmp"):
@@ -509,7 +561,9 @@ def run_all_checks(tof_raw_path, tmp_dir="tmp"):
             shutil.copyfile(root_mtf_output_bmp, tmp_mtf_output_bmp)
         mtf_img = cv2.imread(tmp_mtf_output_bmp, cv2.IMREAD_UNCHANGED)
 
-        tilt_pass, tilt_values, tilt_img = _run_tilt_from_pgm(tmp_pgm_path, tmp_tilt_output_bmp)
+        tilt_pass, tilt_values, tilt_img, tilt_reason = _run_tilt_from_pgm(
+            tmp_pgm_path, tmp_tilt_output_bmp
+        )
 
         return {
             "mtf": {
@@ -521,6 +575,7 @@ def run_all_checks(tof_raw_path, tmp_dir="tmp"):
             "tilt": {
                 "pass": bool(tilt_pass),
                 "values": tilt_values,
+                "reason": tilt_reason,
                 "image": tilt_img,
             },
         }
@@ -543,6 +598,7 @@ if __name__ == "__main__":
     mtf_img = result["mtf"]["image"]
 
     tilt_pass = result["tilt"]["pass"]
+    tilt_reason = result["tilt"]["reason"]
     roll_deg, pitch_deg, yaw_deg, tx_mm, ty_mm, tz_mm = result["tilt"]["values"]
     tilt_img = result["tilt"]["image"]
 
@@ -552,6 +608,7 @@ if __name__ == "__main__":
     print(f"reason: {mtf_reason}")
     print("=== TILT ===")
     print(f"pass: {tilt_pass}")
+    print(f"reason: {tilt_reason}")
     print(
         f"roll={roll_deg:.2f}, pitch={pitch_deg:.2f}, yaw={yaw_deg:.2f}, "
         f"tx={tx_mm:.2f}, ty={ty_mm:.2f}, tz={tz_mm:.2f}"
