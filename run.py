@@ -15,10 +15,10 @@ K = 2500.0
 
 BOTTOM_MM = 300.0
 H_MM = 240.0
-TOP_MM = BOTTOM_MM - H_MM * np.tan(np.deg2rad(10.0))
+TOP_MM = BOTTOM_MM - H_MM * np.tan(np.deg2rad(10.0)) * 2
 HFOV_DEG = 52.0
 
-ANGLE_ABS_DEG_MAX = 5.0
+ANGLE_ABS_DEG_MAX = 10.0
 XY_ABS_MM_MAX = 20.0
 Z_MM_MIN = 400.0
 Z_MM_MAX = 500.0
@@ -147,6 +147,14 @@ class TiltChecker:
             results = self._detect_strongest_corners_per_region(gray_f32)
             self._draw_results(vis, results, scale_x, scale_y)
             pose = self._solve_pose(results, gray_f32.shape[1], gray_f32.shape[0])
+            self._draw_pose_origin_and_axes(
+                vis,
+                pose,
+                width=gray_f32.shape[1],
+                height=gray_f32.shape[0],
+                scale_x=scale_x,
+                scale_y=scale_y,
+            )
             passed, tilt_values, tilt_reason = self._check_tilt_and_extract_values(
                 gray_f32, results, pose
             )
@@ -259,6 +267,67 @@ class TiltChecker:
                 ye = min(vis.shape[0], yi + r + 1)
                 vis[ys:ye, xs:xe] = (0, 0, 255)
 
+    def _draw_pose_origin_and_axes(self, vis, pose, width, height, scale_x, scale_y):
+        if pose is None:
+            return
+        rvec = pose.get("rvec")
+        tvec = pose.get("tvec")
+        if rvec is None or tvec is None:
+            return
+
+        camera_matrix = self._build_camera_matrix(width, height)
+        dist_coeffs = np.zeros((4, 1), dtype=np.float64)
+        axis_len_mm = 60.0
+        # O 为梯形中心原点，X/Y 为平面内轴，Z 为中心旋转轴（法向）。
+        obj_pts = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [axis_len_mm, 0.0, 0.0],
+                [0.0, axis_len_mm, 0.0],
+                [0.0, 0.0, axis_len_mm],
+            ],
+            dtype=np.float32,
+        ).reshape(-1, 1, 3)
+        img_pts, _ = cv2.projectPoints(obj_pts, rvec, tvec, camera_matrix, dist_coeffs)
+        if img_pts is None or img_pts.shape[0] < 4:
+            return
+
+        pts = img_pts.reshape(-1, 2).astype(np.float32)
+
+        def _to_up(pt):
+            return (
+                int(round(float(pt[0]) * float(scale_x))),
+                int(round(float(pt[1]) * float(scale_y))),
+            )
+
+        o = _to_up(pts[0])
+        x_end = _to_up(pts[1])
+        y_end = _to_up(pts[2])
+        z_end = _to_up(pts[3])
+
+        def _label_pos(origin, end, along=14.0, ortho=0.0):
+            vec = np.array([float(end[0] - origin[0]), float(end[1] - origin[1])], dtype=np.float32)
+            norm = float(np.linalg.norm(vec))
+            if norm < 1e-6:
+                return int(end[0] + 8), int(end[1] - 8)
+            unit = vec / norm
+            perp = np.array([-unit[1], unit[0]], dtype=np.float32)
+            p = np.array([float(end[0]), float(end[1])], dtype=np.float32) + unit * float(along) + perp * float(ortho)
+            px = int(np.clip(round(float(p[0])), 0, vis.shape[1] - 1))
+            py = int(np.clip(round(float(p[1])), 0, vis.shape[0] - 1))
+            return px, py
+
+        cv2.circle(vis, o, 4, (0, 255, 255), -1, cv2.LINE_AA)
+        cv2.arrowedLine(vis, o, x_end, (0, 0, 255), 2, cv2.LINE_AA, tipLength=0.2)
+        cv2.arrowedLine(vis, o, y_end, (0, 255, 0), 2, cv2.LINE_AA, tipLength=0.2)
+        cv2.arrowedLine(vis, o, z_end, (255, 0, 0), 2, cv2.LINE_AA, tipLength=0.2)
+        x_text = _label_pos(o, x_end, along=14.0, ortho=-6.0)
+        y_text = _label_pos(o, y_end, along=14.0, ortho=6.0)
+        z_text = _label_pos(o, z_end, along=18.0, ortho=0.0)
+        cv2.putText(vis, "X", x_text, cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 0, 255), 1, cv2.LINE_AA)
+        cv2.putText(vis, "Y", y_text, cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 0), 1, cv2.LINE_AA)
+        cv2.putText(vis, "Z", z_text, cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 0, 0), 1, cv2.LINE_AA)
+
     def _get_image_points(self, results):
         point_map = {}
         for name, _rect, _init_pt, refined_pt in results:
@@ -342,6 +411,8 @@ class TiltChecker:
             "tx_mm": float(tvec[0, 0]),
             "ty_mm": float(tvec[1, 0]),
             "tz_mm": float(tvec[2, 0]),
+            "rvec": rvec.astype(np.float64, copy=True),
+            "tvec": tvec.astype(np.float64, copy=True),
         }
 
     def _check_tilt_and_extract_values(self, gray_f32, results, pose):
@@ -467,15 +538,6 @@ class TiltChecker:
             )
             y += line_h
 
-        ox = vis.shape[1] - 95
-        oy = header_h // 2
-        arrow_len = 45
-        cv2.arrowedLine(header, (ox, oy), (ox + arrow_len, oy), (255, 255, 255), 1, cv2.LINE_AA, tipLength=0.2)
-        cv2.arrowedLine(header, (ox, oy), (ox, oy + arrow_len), (255, 255, 255), 1, cv2.LINE_AA, tipLength=0.2)
-        cv2.putText(header, "+X", (ox + arrow_len + 6, oy + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-        cv2.putText(header, "+Y", (ox - 4, oy + arrow_len + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-        cv2.arrowedLine(header, (ox, oy), (ox + 30, oy - 30), (255, 255, 255), 1, cv2.LINE_AA, tipLength=0.2)
-        cv2.putText(header, "+Z", (ox + 34, oy - 34), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
         return np.vstack([header, vis])
 
 
