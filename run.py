@@ -1,9 +1,8 @@
-import argparse
-import configparser
 import os
 import re
 import shutil
 import subprocess
+import sys
 
 import cv2
 import numpy as np
@@ -57,15 +56,19 @@ def _convert_raw_to_pgm(raw_path, pgm_path):
 
 def _check_mtf_with_exe(mtf_exe_path, work_dir):
     try:
+        old_cwd = os.getcwd()
+        os.chdir(work_dir)
         result = subprocess.run(
-            [mtf_exe_path],
+            [os.path.basename(mtf_exe_path)],
             capture_output=True,
             text=True,
             check=False,
-            cwd=work_dir,
         )
     except Exception as e:
         return 0, 0.0, f"failed to run mtf.exe: {e}"
+    finally:
+        # 不论成功失败，都回到调用前目录（run.py 所在目录）。
+        os.chdir(old_cwd)
 
     output = (result.stdout or "") + "\n" + (result.stderr or "")
 
@@ -115,21 +118,13 @@ def _check_mtf_with_exe(mtf_exe_path, work_dir):
 
 
 def _prepare_mtf_runtime(script_dir, output_dir):
-    # 把 exe/config 放到 output 目录，并把图片路径改成 exe 同目录相对路径。
+    # 只复制 exe/config 到 output 目录，不修改 config.ini 内容。
     src_exe = os.path.join(script_dir, "mtf.exe")
     src_cfg = os.path.join(script_dir, "config.ini")
     dst_exe = os.path.join(output_dir, "mtf.exe")
     dst_cfg = os.path.join(output_dir, "config.ini")
     shutil.copyfile(src_exe, dst_exe)
-
-    parser = configparser.ConfigParser()
-    parser.read(src_cfg, encoding="utf-8")
-    if "settings" not in parser:
-        raise KeyError("config.ini 缺少 [settings] 节")
-    parser["settings"]["input_img_path"] = "tof.pgm"
-    parser["settings"]["output_img_path"] = "output.bmp"
-    with open(dst_cfg, "w", encoding="utf-8") as f:
-        parser.write(f)
+    shutil.copyfile(src_cfg, dst_cfg)
 
 
 class TiltChecker:
@@ -495,26 +490,32 @@ def run_all_checks(tof_raw_path, output_dir="output"):
     1) mtf 是否 pass、mtf 值、报错原因、output.bmp 的 numpy 图像
     2) 倾斜检查是否 pass、6 个值、输出图像 numpy
     """
-    if not os.path.isfile(tof_raw_path):
-        raise FileNotFoundError(f"找不到输入raw: {tof_raw_path}")
-
     original_cwd = os.getcwd()
+    launch_cwd = original_cwd
     script_dir = os.path.dirname(os.path.abspath(__file__))
+    abs_tof_raw_path = (
+        tof_raw_path if os.path.isabs(tof_raw_path) else os.path.abspath(os.path.join(launch_cwd, tof_raw_path))
+    )
+    abs_output_dir = (
+        output_dir if os.path.isabs(output_dir) else os.path.abspath(os.path.join(launch_cwd, output_dir))
+    )
+
+    if not os.path.isfile(abs_tof_raw_path):
+        raise FileNotFoundError(f"找不到输入raw: {abs_tof_raw_path}")
 
     try:
         # 第一件事先切到当前脚本目录，确保 mtf.exe/config.ini 等相对路径稳定。
         os.chdir(script_dir)
 
-        abs_output_dir = os.path.abspath(output_dir)
         os.makedirs(abs_output_dir, exist_ok=True)
 
-        output_raw_path = os.path.join(abs_output_dir, "input.raw")
+        output_raw_path = os.path.join(abs_output_dir, "tof.raw")
         output_pgm_path = os.path.join(abs_output_dir, "tof.pgm")
         output_mtf_bmp_path = os.path.join(abs_output_dir, "output.bmp")
         output_tilt_bmp_path = os.path.join(abs_output_dir, "tilt.bmp")
 
         # mtf.exe 需要实体 raw/pgm 文件，统一放到 output 目录。
-        shutil.copyfile(tof_raw_path, output_raw_path)
+        shutil.copyfile(abs_tof_raw_path, output_raw_path)
         _convert_raw_to_pgm(output_raw_path, output_pgm_path)
 
         # 把 mtf.exe 和 config.ini 放到 output 目录，在 output 目录内执行。
@@ -524,6 +525,9 @@ def run_all_checks(tof_raw_path, output_dir="output"):
             mtf_exe_path, abs_output_dir
         )
         mtf_img = cv2.imread(output_mtf_bmp_path, cv2.IMREAD_UNCHANGED)
+        if mtf_img is None:
+            output_mtf_bmp_path_alt = os.path.join(abs_output_dir, "output", "output.bmp")
+            mtf_img = cv2.imread(output_mtf_bmp_path_alt, cv2.IMREAD_UNCHANGED)
 
         tilt_pass, tilt_values, tilt_img, tilt_reason = _run_tilt_from_pgm(
             output_pgm_path, output_tilt_bmp_path
@@ -550,12 +554,11 @@ def run_all_checks(tof_raw_path, output_dir="output"):
 
 if __name__ == "__main__":
     default_raw = "input.raw" if os.path.isfile("input.raw") else "tof.raw"
-    parser = argparse.ArgumentParser(description="Run MTF + tilt check")
-    parser.add_argument("tof_raw_path", nargs="?", default=default_raw, help="输入tof.raw，默认 input.raw 或 tof.raw")
-    parser.add_argument("--output-dir", default="output", help="输出目录，默认 output")
-    args = parser.parse_args()
+    args = sys.argv[1:]
+    tof_raw_path = args[0] if len(args) >= 1 else default_raw
+    output_dir = args[1] if len(args) >= 2 else "output"
 
-    result = run_all_checks(args.tof_raw_path, output_dir=args.output_dir)
+    result = run_all_checks(tof_raw_path, output_dir=output_dir)
 
     mtf_pass = result["mtf"]["pass"]
     mtf_value = result["mtf"]["value"]
