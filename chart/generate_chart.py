@@ -6,12 +6,11 @@ width = 600
 height = 600
 
 #定义梯形块的高度以及顶底长度
-h = 240
-bottom = 300
+h = 200
+bottom = 250
 top = bottom - 2 * h * math.tan(math.radians(10))
-grid_x_offset = 42
-grid_y_offset = 60
-print(top)
+grid_x_offset = 85
+grid_y_offset = 100
 
 #绘制梯形
 name = "%dx%dmm"%(width, height)
