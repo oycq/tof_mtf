@@ -8,10 +8,9 @@ import cv2
 import numpy as np
 
 
-RAW_ROWS = 31
+RAW_ROWS = 30
 RAW_COLS = 40
 RAW_BINS = 64
-TOTAL_COUNT = RAW_ROWS * RAW_COLS * RAW_BINS
 K = 2500.0
 
 BOTTOM_MM = 300.0
@@ -26,15 +25,26 @@ Z_MM_MAX = 500.0
 
 
 def _convert_raw_to_pgm(raw_path, pgm_path):
+    raw_rows_with_header = RAW_ROWS + 1
+    total_count = RAW_ROWS * RAW_COLS * RAW_BINS
+    total_count_with_header = raw_rows_with_header * RAW_COLS * RAW_BINS
+
     data = np.fromfile(raw_path, dtype=np.uint16)
-    if data.size != TOTAL_COUNT:
+    if data.size not in (total_count, total_count_with_header):
         raise ValueError(
-            f"raw长度不对: actual={data.size}, expected={TOTAL_COUNT}, path={raw_path}"
+            "raw长度不对: "
+            f"actual={data.size}, "
+            f"expected={total_count} or {total_count_with_header}, "
+            f"path={raw_path}"
         )
 
-    data = data.reshape(RAW_ROWS, RAW_COLS, RAW_BINS).astype(np.float32)
-    hist = data[1:, :, :62]
-    sat = data[1:, :, 62] * 1024 + data[1:, :, 63]
+    rows = RAW_ROWS if data.size == total_count else raw_rows_with_header
+    data = data.reshape(rows, RAW_COLS, RAW_BINS).astype(np.float32)
+    # 兼容有头/无头：统一只取最后 30x40 区域。
+    data = data[-RAW_ROWS:, :, :]
+
+    hist = data[:, :, :62]
+    sat = data[:, :, 62] * 1024 + data[:, :, 63]
     depth_like = hist * 50000 / sat[:, :, None]
 
     img = depth_like.mean(axis=2) / K * 255.0
