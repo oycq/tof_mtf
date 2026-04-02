@@ -188,8 +188,8 @@ class TiltChecker:
         return image.astype(np.float32)
 
     def _build_display_image(self, gray):
-        disp = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
-        disp = disp.astype(np.uint8)
+        # 对齐 MTF 的亮度显示方式：使用固定 0~255 映射，不做逐帧 min-max 拉伸。
+        disp = np.clip(gray, 0.0, 255.0).astype(np.uint8)
         return cv2.cvtColor(disp, cv2.COLOR_GRAY2BGR)
 
     def _upscale_to_300x400(self, gray_f32):
