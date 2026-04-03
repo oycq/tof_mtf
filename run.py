@@ -13,15 +13,15 @@ RAW_COLS = 40
 RAW_BINS = 64
 K = 2500.0
 
-BOTTOM_MM = 300.0
-H_MM = 240.0
+BOTTOM_MM = 250.0
+H_MM = 200.0
 TOP_MM = BOTTOM_MM - H_MM * np.tan(np.deg2rad(10.0)) * 2
-HFOV_DEG = 52.0
+HFOV_DEG = 55.0
 
 ANGLE_ABS_DEG_MAX = 10.0
 XY_ABS_MM_MAX = 20.0
-Z_MM_MIN = 400.0
-Z_MM_MAX = 500.0
+Z_MM_MIN = 380.0
+Z_MM_MAX = 420.0
 
 
 def _convert_raw_to_pgm(raw_path, pgm_path):
