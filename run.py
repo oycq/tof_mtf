@@ -16,7 +16,7 @@ K = 2500.0
 BOTTOM_MM = 250.0
 H_MM = 200.0
 TOP_MM = BOTTOM_MM - H_MM * np.tan(np.deg2rad(10.0)) * 2
-HFOV_DEG = 55.0
+HFOV_DEG = 60.0
 
 ANGLE_ABS_DEG_MAX = 10.0
 XY_ABS_MM_MAX = 20.0
@@ -615,7 +615,7 @@ def run_all_checks(tof_raw_path, output_dir="output"):
 
 
 if __name__ == "__main__":
-    default_raw = "input.raw" if os.path.isfile("input.raw") else "tof.raw"
+    default_raw = "v.raw" if os.path.isfile("v.raw") else "tof.raw"
     args = sys.argv[1:]
     tof_raw_path = args[0] if len(args) >= 1 else default_raw
     output_dir = args[1] if len(args) >= 2 else "output"
