@@ -11,7 +11,7 @@ from PIL import Image, ImageDraw, ImageFont
 RAW_ROWS = 30
 RAW_COLS = 40
 RAW_BINS = 64
-K = 2500.0
+K = 1024.0
 
 BOTTOM_MM = 250.0
 H_MM = 200.0
@@ -22,6 +22,15 @@ ANGLE_ABS_DEG_MAX = 10.0
 XY_ABS_MM_MAX = 20.0
 Z_MM_MIN = 380.0
 Z_MM_MAX = 420.0
+
+# 像素亮度统计的检测阈值（针对 30x40 的灰度 pgm，灰度范围 0~255）。
+# 把所有像素按亮度排序后取最亮/最暗 20% 区域分别计算均值。
+BRIGHT_TOP_RATIO = 0.20
+BRIGHT_TOP_MEAN_MIN = 80.0   # 亮 20% 均值的下限（过暗 -> 光源不够亮）
+BRIGHT_TOP_MEAN_MAX = 240.0  # 亮 20% 均值的上限（过亮 -> 光源过曝）
+
+DARK_BOTTOM_RATIO = 0.20
+DARK_BOTTOM_MEAN_MAX = 30.0  # 暗 20% 均值的上限（过亮 -> 暗区不够暗，可能脏污）
 
 
 # 包根目录（mtf.exe / config.ini 所在）。无论在哪 import 都能定位。
@@ -60,7 +69,17 @@ def _convert_raw_to_pgm(raw_path, pgm_path):
         raise RuntimeError(f"写入pgm失败: {pgm_path}")
 
 
-_MTF_ITEM_NAMES = ("MTF 运行", "MTF 解析", "光源亮度", "MTF 角块数", "MTF 清晰度")
+_MTF_ITEM_NAMES = (
+    "MTF 运行",
+    "MTF 解析",
+    "过曝检测",
+    "检测到的MTF斜边数量",
+    "MTF 清晰度",
+)
+_MTF_BOXES_THR_STR = ">= 2"
+# mtf.exe 在 "clarity is GOOD!" 分支不会再单独输出条件行，给 MTF 清晰度阈值
+# 一个兜底显示文案；实际若条件行可解析，会用解析到的具体数值覆盖这里。
+_MTF_VALUE_THR_FALLBACK = "> 0.50"
 
 
 def _mk_item(name, status, measured, threshold, note=""):
@@ -122,40 +141,53 @@ def _check_mtf_with_exe(mtf_exe_path, work_dir):
     items.append(_mk_item("MTF 解析", "PASS", f"{clarity_value:.4f}", "成功解析"))
 
     if "The light panel is too bright" in output:
-        items.append(_mk_item("光源亮度", "FAIL", "过亮", "未过曝", "光板过曝"))
+        items.append(_mk_item("过曝检测", "FAIL", "过曝", "未过曝", "光板过曝"))
         _skip_rest(3, "光源过亮")
         return 0, clarity_value, "The light panel is too bright", items
 
-    items.append(_mk_item("光源亮度", "PASS", "正常", "未过曝"))
+    items.append(_mk_item("过曝检测", "PASS", "未过曝", "未过曝"))
 
-    if "clarity is GOOD!" in output:
-        n_match = re.search(r"n\s*=\s*([0-9]+)", output)
-        n_str = f"n={int(n_match.group(1))}" if n_match else "正常"
-        items.append(_mk_item("MTF 角块数", "PASS", n_str, "> 阈值"))
-        items.append(_mk_item("MTF 清晰度", "PASS", f"{clarity_value:.4f}", "> 阈值"))
-        return 1, clarity_value, "GOOD", items
-
+    # 尝试解析条件行（GOOD 与 FAIL 都可能出现），用以拿到 mtf.exe 当前生效的阈值。
     cond_match = re.search(
-        r"(n\s*=\s*([0-9]+)\s*>\s*([0-9]+)\s*value\s*=\s*([0-9]*\.?[0-9]+)\s*>\s*([0-9]*\.?[0-9]+)\|?)",
+        r"n\s*=\s*([0-9]+)\s*>\s*([0-9]+)\s*value\s*=\s*([0-9]*\.?[0-9]+)\s*>\s*([0-9]*\.?[0-9]+)",
         output,
         re.IGNORECASE,
     )
+    cond_n_actual = int(cond_match.group(1)) if cond_match else None
+    cond_value_threshold = float(cond_match.group(4)) if cond_match else None
+    value_thr_str = (
+        f"> {cond_value_threshold:.2f}" if cond_value_threshold is not None
+        else _MTF_VALUE_THR_FALLBACK
+    )
+
+    if "clarity is GOOD!" in output:
+        if cond_n_actual is not None:
+            n_str = f"{cond_n_actual} 条"
+        else:
+            n_match = re.search(r"n\s*=\s*([0-9]+)", output)
+            n_str = f"{int(n_match.group(1))} 条" if n_match else "正常"
+        items.append(_mk_item("检测到的MTF斜边数量", "PASS", n_str, _MTF_BOXES_THR_STR))
+        items.append(_mk_item("MTF 清晰度", "PASS", f"{clarity_value:.4f}", value_thr_str))
+        return 1, clarity_value, "GOOD", items
+
     if not cond_match:
-        items.append(_mk_item("MTF 角块数", "FAIL", "?", "?", "条件行缺失"))
-        items.append(_mk_item("MTF 清晰度", "FAIL", "?", "?", "条件行缺失"))
+        items.append(_mk_item("检测到的MTF斜边数量", "FAIL", "?", _MTF_BOXES_THR_STR, "条件行缺失"))
+        items.append(_mk_item("MTF 清晰度", "FAIL", "?", value_thr_str, "条件行缺失"))
         return 0, clarity_value, "condition line not found: n = ... value = ...", items
 
-    n_actual = int(cond_match.group(2))
-    n_threshold = int(cond_match.group(3))
-    value_actual = float(cond_match.group(4))
-    value_threshold = float(cond_match.group(5))
+    n_actual = cond_n_actual
+    n_threshold = int(cond_match.group(2))
+    value_actual = float(cond_match.group(3))
+    value_threshold = cond_value_threshold
 
     failed_reasons = []
     if n_actual > n_threshold:
-        items.append(_mk_item("MTF 角块数", "PASS", f"n={n_actual}", f"> {n_threshold}"))
+        items.append(_mk_item(
+            "检测到的MTF斜边数量", "PASS", f"{n_actual} 条", _MTF_BOXES_THR_STR
+        ))
     else:
         items.append(_mk_item(
-            "MTF 角块数", "FAIL", f"n={n_actual}", f"> {n_threshold}", "清晰角块不足"
+            "检测到的MTF斜边数量", "FAIL", f"{n_actual} 条", _MTF_BOXES_THR_STR, "斜边数量不足"
         ))
         failed_reasons.append(
             f"required at least {n_threshold + 1} MTF boxes, actual {n_actual}"
@@ -163,11 +195,11 @@ def _check_mtf_with_exe(mtf_exe_path, work_dir):
 
     if value_actual > value_threshold:
         items.append(_mk_item(
-            "MTF 清晰度", "PASS", f"{value_actual:.4f}", f"> {value_threshold:.2f}"
+            "MTF 清晰度", "PASS", f"{value_actual:.4f}", value_thr_str
         ))
     else:
         items.append(_mk_item(
-            "MTF 清晰度", "FAIL", f"{value_actual:.4f}", f"> {value_threshold:.2f}", "低于阈值"
+            "MTF 清晰度", "FAIL", f"{value_actual:.4f}", value_thr_str, "低于阈值"
         ))
         failed_reasons.append(
             f"mtf value {value_actual:.4f} below threshold: {value_threshold:.2f}"
@@ -176,6 +208,63 @@ def _check_mtf_with_exe(mtf_exe_path, work_dir):
     if failed_reasons:
         return 0, clarity_value, failed_reasons, items
     return 0, clarity_value, "Unknown error, contact developer", items
+
+
+def _check_image_stats(pgm_path):
+    """对 pgm 灰度图做像素亮度统计：
+
+    1. 光源检测 — 最亮 ``BRIGHT_TOP_RATIO`` 像素的均值要落在
+       ``[BRIGHT_TOP_MEAN_MIN, BRIGHT_TOP_MEAN_MAX]`` 区间。
+    2. 脏污检测 — 最暗 ``DARK_BOTTOM_RATIO`` 像素的均值要 ≤ ``DARK_BOTTOM_MEAN_MAX``。
+
+    返回 ``(items, bright_mean, dirt_mean, bright_ok, dirt_ok)``。
+    """
+    bright_thr_str = f"[{BRIGHT_TOP_MEAN_MIN:.0f}, {BRIGHT_TOP_MEAN_MAX:.0f}]"
+    dirt_thr_str = f"<= {DARK_BOTTOM_MEAN_MAX:.0f}"
+    items = []
+
+    img = cv2.imread(pgm_path, cv2.IMREAD_UNCHANGED) if os.path.isfile(pgm_path) else None
+    if img is None:
+        items.append(_mk_item("光源检测", "FAIL", "读取失败", bright_thr_str, "灰度图读取失败"))
+        items.append(_mk_item("脏污检测", "FAIL", "读取失败", dirt_thr_str, "灰度图读取失败"))
+        return items, float("nan"), float("nan"), False, False
+
+    if img.ndim == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    flat = img.reshape(-1).astype(np.float32)
+    n = flat.size
+    if n <= 0:
+        items.append(_mk_item("光源检测", "FAIL", "空图", bright_thr_str, "像素数为 0"))
+        items.append(_mk_item("脏污检测", "FAIL", "空图", dirt_thr_str, "像素数为 0"))
+        return items, float("nan"), float("nan"), False, False
+
+    flat_sorted = np.sort(flat)
+    k_bright = max(int(round(n * BRIGHT_TOP_RATIO)), 1)
+    k_dark = max(int(round(n * DARK_BOTTOM_RATIO)), 1)
+
+    bright_mean = float(np.mean(flat_sorted[-k_bright:]))
+    dirt_mean = float(np.mean(flat_sorted[:k_dark]))
+
+    bright_ok = BRIGHT_TOP_MEAN_MIN <= bright_mean <= BRIGHT_TOP_MEAN_MAX
+    items.append(_mk_item(
+        "光源检测",
+        "PASS" if bright_ok else "FAIL",
+        f"{bright_mean:.1f}",
+        bright_thr_str,
+        "" if bright_ok else "亮区均值超出范围",
+    ))
+
+    dirt_ok = dirt_mean <= DARK_BOTTOM_MEAN_MAX
+    items.append(_mk_item(
+        "脏污检测",
+        "PASS" if dirt_ok else "FAIL",
+        f"{dirt_mean:.1f}",
+        dirt_thr_str,
+        "" if dirt_ok else "暗区过亮，疑似脏污",
+    ))
+
+    return items, bright_mean, dirt_mean, bright_ok, dirt_ok
 
 
 def _prepare_mtf_runtime(package_dir, output_dir):
@@ -720,29 +809,33 @@ def _put_text(img, text, org, color, size=16, bold=False, align="left"):
     img[:] = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
 
 
-def _draw_test_panel(items, overall_pass):
-    """绘制产测项目面板（可贴在主图右侧），宽度固定为 _PANEL_WIDTH。"""
+def _draw_test_panel(sections, overall_pass):
+    """绘制产测项目面板（贴在主图右侧），宽度固定为 _PANEL_WIDTH。
+
+    sections: list[(section_title, items)]，按 section 分组绘制。
+    """
     panel_w = _PANEL_WIDTH
     pad_x = 16
-    title_h = 50
+    title_h = 52
     line_h = 26
-    sep_h = 1
-    n_items = len(items)
-    panel_h = title_h + sep_h + n_items * line_h + 18
+    section_head_h = 30
+    section_gap = 8
+    bottom_pad = 14
 
+    n_items = sum(len(its) for _, its in sections)
+    panel_h = title_h + len(sections) * (section_head_h + section_gap) + n_items * line_h + bottom_pad
     panel = np.full((panel_h, panel_w, 3), 24, dtype=np.uint8)
 
-    # 标题 & 总状态
-    title_y = 32
+    # 主标题 & 总判定
+    title_y = 34
     _put_text(panel, "产测项目", (pad_x, title_y), (235, 235, 235), size=22, bold=True)
     overall_text = f"总判定: {'通过' if overall_pass else '失败'}"
     overall_color = _STATUS_COLORS["PASS" if overall_pass else "FAIL"]
     _put_text(panel, overall_text, (panel_w - pad_x, title_y),
               overall_color, size=22, bold=True, align="right")
 
-    # 分隔线
-    sep_y = title_h
-    cv2.line(panel, (pad_x, sep_y), (panel_w - pad_x, sep_y), (90, 90, 90), 1)
+    # 主分隔线
+    cv2.line(panel, (pad_x, title_h - 4), (panel_w - pad_x, title_h - 4), (110, 110, 110), 1)
 
     # 列 x 位置：name / measured(右) / threshold(左) / status(右)
     col_name_x = pad_x
@@ -750,18 +843,37 @@ def _draw_test_panel(items, overall_pass):
     col_threshold_x = 258
     col_status_right = panel_w - pad_x
 
-    y = sep_y + line_h
-    for it in items:
-        color = _STATUS_COLORS.get(it["status"], (220, 220, 220))
-        status_cn = _STATUS_TEXT_CN.get(it["status"], it["status"])
-        _put_text(panel, it["name"], (col_name_x, y), color, size=15)
-        _put_text(panel, it["measured"], (col_measured_right, y),
-                  color, size=15, align="right")
-        _put_text(panel, it["threshold"], (col_threshold_x, y),
-                  (210, 210, 210), size=15)
-        _put_text(panel, f"[{status_cn}]", (col_status_right, y),
-                  color, size=16, bold=True, align="right")
-        y += line_h
+    section_color = (170, 200, 255)  # 浅蓝白
+    y = title_h + section_gap
+
+    for sec_title, items in sections:
+        # section header：标题 + 左侧色条
+        head_baseline = y + section_head_h - 8
+        bar_top = y + 6
+        bar_bottom = y + section_head_h - 4
+        cv2.rectangle(panel, (pad_x - 6, bar_top), (pad_x - 2, bar_bottom),
+                      section_color, -1)
+        _put_text(panel, sec_title, (pad_x + 4, head_baseline),
+                  section_color, size=18, bold=True)
+        # 细分隔线在 section 标题下面
+        sub_sep_y = y + section_head_h - 2
+        cv2.line(panel, (pad_x, sub_sep_y), (panel_w - pad_x, sub_sep_y),
+                 (70, 70, 90), 1)
+        y += section_head_h + 4
+
+        for it in items:
+            color = _STATUS_COLORS.get(it["status"], (220, 220, 220))
+            status_cn = _STATUS_TEXT_CN.get(it["status"], it["status"])
+            _put_text(panel, it["name"], (col_name_x, y + line_h - 6), color, size=15)
+            _put_text(panel, it["measured"], (col_measured_right, y + line_h - 6),
+                      color, size=15, align="right")
+            _put_text(panel, it["threshold"], (col_threshold_x, y + line_h - 6),
+                      (210, 210, 210), size=15)
+            _put_text(panel, f"[{status_cn}]", (col_status_right, y + line_h - 6),
+                      color, size=16, bold=True, align="right")
+            y += line_h
+
+        y += section_gap
 
     return panel
 
@@ -773,7 +885,7 @@ _LEFT_WIDTH = _OUTPUT_WIDTH - _PANEL_WIDTH - _PANEL_SEP_WIDTH
 _HEADER_HEIGHT = 48
 
 
-def _compose_combined_image(mtf_img, tilt_img, items=None, overall_pass=False):
+def _compose_combined_image(mtf_img, tilt_img, sections=None, overall_pass=False):
     """把 MTF / Tilt 两张图横向拼接，并在右侧贴上产测项目面板。
 
     输出宽度固定为 ``_OUTPUT_WIDTH``。所有文字都直接在最终画布上原生绘制，
@@ -782,8 +894,8 @@ def _compose_combined_image(mtf_img, tilt_img, items=None, overall_pass=False):
     mtf_bgr = _to_bgr(mtf_img)
     tilt_bgr = _to_bgr(tilt_img)
 
-    # 没有 items 时整张图就是 left 区域，把 left 区域宽度撑满到 _OUTPUT_WIDTH。
-    left_width = _LEFT_WIDTH if items else _OUTPUT_WIDTH
+    # 没有 sections 时整张图就是 left 区域，把 left 区域宽度撑满到 _OUTPUT_WIDTH。
+    left_width = _LEFT_WIDTH if sections else _OUTPUT_WIDTH
 
     # 按面积/宽高比把 left_width 分给 MTF 和 Tilt：选一个共同高度 H，使
     # mtf_w + tilt_w == left_width。
@@ -805,10 +917,10 @@ def _compose_combined_image(mtf_img, tilt_img, items=None, overall_pass=False):
               (255, 255, 255), size=22, bold=True)
     left = np.vstack([header, body])
 
-    if not items:
+    if not sections:
         return left
 
-    panel = _draw_test_panel(items, overall_pass)
+    panel = _draw_test_panel(sections, overall_pass)
     # 高度对齐（不足部分用相同底色补齐），文字已经原生贴好，不会被再缩放。
     out_h = max(left.shape[0], panel.shape[0])
     if left.shape[0] < out_h:
@@ -844,8 +956,9 @@ def run_all_checks(tof_raw_path):
         image : numpy.ndarray
             MTF 与 Tilt 横向拼接的结果图（带 header 标签）。
         params : list[float]
-            7 个数值，依次是
-            ``[mtf_value, roll_deg, pitch_deg, yaw_deg, tx_mm, ty_mm, tz_mm]``。
+            9 个数值，依次是
+            ``[mtf_value, roll_deg, pitch_deg, yaw_deg, tx_mm, ty_mm, tz_mm,
+            bright_top20_mean, dark_bottom20_mean]``。
             缺失或失败时对应位置为 ``nan``。
     """
     original_cwd = os.getcwd()
@@ -889,15 +1002,28 @@ def run_all_checks(tof_raw_path):
             tmp_mtf_bmp_path_alt = os.path.join(abs_tmp_dir, "output", "output.bmp")
             mtf_img = cv2.imread(tmp_mtf_bmp_path_alt, cv2.IMREAD_UNCHANGED)
 
+        # 基于 pgm 的整图亮度统计：光源检测 + 脏污检测
+        img_items, bright_mean, dirt_mean, bright_ok, dirt_ok = _check_image_stats(tmp_pgm_path)
+
         tilt_pass, tilt_values, tilt_img, tilt_reason, tilt_items = _run_tilt_from_pgm(
             tmp_pgm_path, tmp_tilt_bmp_path
         )
 
-        passed = bool(mtf_pass) and bool(tilt_pass)
+        passed = bool(mtf_pass) and bool(tilt_pass) and bool(bright_ok) and bool(dirt_ok)
         mtf_value_f = float(mtf_value) if mtf_value is not None else float("nan")
-        params = [mtf_value_f] + [float(v) for v in tilt_values]
+        # params 顺序: [mtf_value, roll, pitch, yaw, tx, ty, tz, bright_top20_mean, dark_bottom20_mean]
+        params = (
+            [mtf_value_f]
+            + [float(v) for v in tilt_values]
+            + [float(bright_mean), float(dirt_mean)]
+        )
+        sections = [
+            ("MTF 检测", mtf_items),
+            ("姿态检测", tilt_items),
+            ("脏污检测", img_items),
+        ]
         image = _compose_combined_image(
-            mtf_img, tilt_img, items=mtf_items + tilt_items, overall_pass=passed
+            mtf_img, tilt_img, sections=sections, overall_pass=passed,
         )
         return passed, image, params
     finally:

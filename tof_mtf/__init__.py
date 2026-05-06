@@ -14,7 +14,8 @@ tof_mtf
     passed, image, params = run_all_checks("tof.raw")
     # passed : bool
     # image  : numpy.ndarray，MTF + Tilt 拼接图
-    # params : [mtf_value, roll, pitch, yaw, tx, ty, tz]
+    # params : [mtf_value, roll, pitch, yaw, tx, ty, tz,
+    #          bright_top20_mean, dark_bottom20_mean]
 
 返回结构详见 :func:`run_all_checks`。
 """
