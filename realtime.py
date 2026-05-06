@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-实时读取 ToF 数据，仅调用 run.py 的 run_all_checks 接口：
+实时读取 ToF 数据，仅调用 tof_mtf 包的 run_all_checks 接口：
 - 清晰度(MTF)
 - 倾斜(Tilt)
 
@@ -25,7 +25,7 @@ from typing import Deque, Optional
 import cv2
 import numpy as np
 
-from run import run_all_checks
+from tof_mtf import run_all_checks
 
 
 TOF_H = 30
@@ -39,7 +39,6 @@ ADB_PULL_TIMEOUT_S = 0.9
 TMP_DIR = Path("./tmp")
 TMP_PULL_RAW_PATH = TMP_DIR / "tof_pull.raw"
 TMP_CHECK_RAW_PATH = TMP_DIR / "realtime_check.raw"
-TMP_OUTPUT_DIR = TMP_DIR / "realtime_output"
 REC_DIR = TMP_DIR
 REC_FPS = 20.0
 
@@ -226,7 +225,6 @@ def main() -> int:
     cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
 
     TMP_DIR.mkdir(parents=True, exist_ok=True)
-    TMP_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     tof_srv = ToFRealtimeServer(queue_maxlen=3, min_peak_count=100.0, target_fps=float(TARGET_FPS))
     tof_srv.start()
@@ -246,7 +244,7 @@ def main() -> int:
                 try:
                     latest_raw_bytes = bytes(frame.raw_bytes)
                     TMP_CHECK_RAW_PATH.write_bytes(frame.raw_bytes)
-                    res = run_all_checks(str(TMP_CHECK_RAW_PATH), output_dir=str(TMP_OUTPUT_DIR))
+                    res = run_all_checks(str(TMP_CHECK_RAW_PATH))
                     mtf_img = res["mtf"]["image"]
                     tilt_img = res["tilt"]["image"]
                     if mtf_img is not None:
