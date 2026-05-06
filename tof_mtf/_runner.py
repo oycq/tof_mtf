@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import shutil
@@ -6,6 +7,29 @@ import subprocess
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+
+
+# 包根目录（mtf.exe / config.ini / thresholds.json 所在）。
+# 用 __file__ 锚定，无论在哪个 cwd 下 import 都能找到。
+_PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
+_TMP_DIR = os.path.join(_PACKAGE_DIR, "tmp")
+_THRESHOLDS_PATH = os.path.join(_PACKAGE_DIR, "thresholds.json")
+
+
+def _load_thresholds():
+    """加载包内 thresholds.json；找不到或解析失败时回退到空 dict。"""
+    try:
+        with open(_THRESHOLDS_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+_THRESHOLDS = _load_thresholds()
+# json 里 mtf 段直接是要写到 mtf.exe config.ini 的字段（key=value）。
+_TH_MTF = _THRESHOLDS.get("mtf", {}) or {}
+_TH_TILT = _THRESHOLDS.get("tilt", {}) or {}
+_TH_DIRTY = _THRESHOLDS.get("dirty", {}) or {}
 
 
 RAW_ROWS = 30
@@ -18,25 +42,21 @@ H_MM = 200.0
 TOP_MM = BOTTOM_MM - H_MM * np.tan(np.deg2rad(10.0)) * 2
 HFOV_DEG = 60.0
 
-ANGLE_ABS_DEG_MAX = 10.0
-XY_ABS_MM_MAX = 20.0
-Z_MM_MIN = 380.0
-Z_MM_MAX = 420.0
+# Tilt 阈值（用户在 thresholds.json 里调）。
+ANGLE_ABS_DEG_MAX = float(_TH_TILT.get("angle_abs_deg_max", 10.0))
+XY_ABS_MM_MAX = float(_TH_TILT.get("xy_abs_mm_max", 20.0))
+Z_MM_MIN = float(_TH_TILT.get("z_mm_min", 380.0))
+Z_MM_MAX = float(_TH_TILT.get("z_mm_max", 420.0))
 
-# 像素亮度统计的检测阈值（针对 30x40 的灰度 pgm，灰度范围 0~255）。
-# 把所有像素按亮度排序后取最亮/最暗 20% 区域分别计算均值。
+# 脏污检测阈值（用户在 thresholds.json 里调）。
+BRIGHT_TOP_MEAN_MIN = float(_TH_DIRTY.get("bright_top_mean_min", 80.0))
+BRIGHT_TOP_MEAN_MAX = float(_TH_DIRTY.get("bright_top_mean_max", 240.0))
+DARK_BOTTOM_MEAN_MAX = float(_TH_DIRTY.get("dark_bottom_mean_max", 30.0))
+
+# 取最亮/最暗多少比例像素来计算均值——这两个比例是算法实现细节，常年不变，
+# 不放进 thresholds.json，避免干扰调试人员。
 BRIGHT_TOP_RATIO = 0.20
-BRIGHT_TOP_MEAN_MIN = 80.0   # 亮 20% 均值的下限（过暗 -> 光源不够亮）
-BRIGHT_TOP_MEAN_MAX = 240.0  # 亮 20% 均值的上限（过亮 -> 光源过曝）
-
 DARK_BOTTOM_RATIO = 0.20
-DARK_BOTTOM_MEAN_MAX = 30.0  # 暗 20% 均值的上限（过亮 -> 暗区不够暗，可能脏污）
-
-
-# 包根目录（mtf.exe / config.ini 所在）。无论在哪 import 都能定位。
-_PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
-# 所有运行中间产物统一放在包内 tmp 目录下，避免污染调用方目录。
-_TMP_DIR = os.path.join(_PACKAGE_DIR, "tmp")
 
 
 def _convert_raw_to_pgm(raw_path, pgm_path):
@@ -73,7 +93,7 @@ _MTF_ITEM_NAMES = (
     "MTF 运行",
     "MTF 解析",
     "过曝检测",
-    "检测到的MTF斜边数量",
+    "MTF斜边数量",
     "MTF 清晰度",
 )
 _MTF_BOXES_THR_STR = ">= 2"
@@ -166,12 +186,12 @@ def _check_mtf_with_exe(mtf_exe_path, work_dir):
         else:
             n_match = re.search(r"n\s*=\s*([0-9]+)", output)
             n_str = f"{int(n_match.group(1))} 条" if n_match else "正常"
-        items.append(_mk_item("检测到的MTF斜边数量", "PASS", n_str, _MTF_BOXES_THR_STR))
+        items.append(_mk_item("MTF 斜边数量", "PASS", n_str, _MTF_BOXES_THR_STR))
         items.append(_mk_item("MTF 清晰度", "PASS", f"{clarity_value:.4f}", value_thr_str))
         return 1, clarity_value, "GOOD", items
 
     if not cond_match:
-        items.append(_mk_item("检测到的MTF斜边数量", "FAIL", "?", _MTF_BOXES_THR_STR, "条件行缺失"))
+        items.append(_mk_item("MTF 斜边数量", "FAIL", "?", _MTF_BOXES_THR_STR, "条件行缺失"))
         items.append(_mk_item("MTF 清晰度", "FAIL", "?", value_thr_str, "条件行缺失"))
         return 0, clarity_value, "condition line not found: n = ... value = ...", items
 
@@ -183,11 +203,11 @@ def _check_mtf_with_exe(mtf_exe_path, work_dir):
     failed_reasons = []
     if n_actual > n_threshold:
         items.append(_mk_item(
-            "检测到的MTF斜边数量", "PASS", f"{n_actual} 条", _MTF_BOXES_THR_STR
+            "MTF 斜边数量", "PASS", f"{n_actual} 条", _MTF_BOXES_THR_STR
         ))
     else:
         items.append(_mk_item(
-            "检测到的MTF斜边数量", "FAIL", f"{n_actual} 条", _MTF_BOXES_THR_STR, "斜边数量不足"
+            "MTF 斜边数量", "FAIL", f"{n_actual} 条", _MTF_BOXES_THR_STR, "斜边数量不足"
         ))
         failed_reasons.append(
             f"required at least {n_threshold + 1} MTF boxes, actual {n_actual}"
@@ -213,7 +233,7 @@ def _check_mtf_with_exe(mtf_exe_path, work_dir):
 def _check_image_stats(pgm_path):
     """对 pgm 灰度图做像素亮度统计：
 
-    1. 光源检测 — 最亮 ``BRIGHT_TOP_RATIO`` 像素的均值要落在
+    1. 光源亮度 — 最亮 ``BRIGHT_TOP_RATIO`` 像素的均值要落在
        ``[BRIGHT_TOP_MEAN_MIN, BRIGHT_TOP_MEAN_MAX]`` 区间。
     2. 脏污检测 — 最暗 ``DARK_BOTTOM_RATIO`` 像素的均值要 ≤ ``DARK_BOTTOM_MEAN_MAX``。
 
@@ -225,7 +245,7 @@ def _check_image_stats(pgm_path):
 
     img = cv2.imread(pgm_path, cv2.IMREAD_UNCHANGED) if os.path.isfile(pgm_path) else None
     if img is None:
-        items.append(_mk_item("光源检测", "FAIL", "读取失败", bright_thr_str, "灰度图读取失败"))
+        items.append(_mk_item("光源亮度", "FAIL", "读取失败", bright_thr_str, "灰度图读取失败"))
         items.append(_mk_item("脏污检测", "FAIL", "读取失败", dirt_thr_str, "灰度图读取失败"))
         return items, float("nan"), float("nan"), False, False
 
@@ -235,7 +255,7 @@ def _check_image_stats(pgm_path):
     flat = img.reshape(-1).astype(np.float32)
     n = flat.size
     if n <= 0:
-        items.append(_mk_item("光源检测", "FAIL", "空图", bright_thr_str, "像素数为 0"))
+        items.append(_mk_item("光源亮度", "FAIL", "空图", bright_thr_str, "像素数为 0"))
         items.append(_mk_item("脏污检测", "FAIL", "空图", dirt_thr_str, "像素数为 0"))
         return items, float("nan"), float("nan"), False, False
 
@@ -248,7 +268,7 @@ def _check_image_stats(pgm_path):
 
     bright_ok = BRIGHT_TOP_MEAN_MIN <= bright_mean <= BRIGHT_TOP_MEAN_MAX
     items.append(_mk_item(
-        "光源检测",
+        "光源亮度",
         "PASS" if bright_ok else "FAIL",
         f"{bright_mean:.1f}",
         bright_thr_str,
@@ -267,14 +287,78 @@ def _check_image_stats(pgm_path):
     return items, bright_mean, dirt_mean, bright_ok, dirt_ok
 
 
+# 让用户在 thresholds.json 里只填一个高层 key，写入 config.ini 时展开到多个
+# 真实字段。比如填 mtf_throat=0.5 就同时设置 field_a_throat / field_b_throat。
+_MTF_KEY_ALIASES = {
+    "mtf_throat": ["field_a_throat", "field_b_throat"],
+}
+
+
+def _apply_mtf_config_overrides(cfg_path):
+    """根据 thresholds.json 中 ``mtf`` 段修改给定 config.ini。
+
+    json 里 mtf 段下的 key=value：
+      * 若 key 在 _MTF_KEY_ALIASES 里，则展开成对应的多个真实字段；
+      * 否则直接当作 config.ini 字段名使用。
+    使用按行替换的方式，尽量保留原文件的注释与字段顺序；任何 json 中存在
+    但 config.ini 不存在的字段会追加到末尾。
+    """
+    overrides = _TH_MTF
+    if not overrides:
+        return
+
+    str_overrides = {}
+    for k, v in overrides.items():
+        formatted = _format_ini_value(v)
+        for real_key in _MTF_KEY_ALIASES.get(str(k), [str(k)]):
+            str_overrides[real_key] = formatted
+
+    if not os.path.isfile(cfg_path):
+        return
+
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    pending = dict(str_overrides)
+    new_lines = []
+    line_re = re.compile(r"^(\s*)([A-Za-z_][\w]*)(\s*=\s*)(.*?)(\s*\r?\n?)$")
+    for line in lines:
+        m = line_re.match(line)
+        if m and m.group(2) in pending:
+            key = m.group(2)
+            new_val = pending.pop(key)
+            new_lines.append(f"{m.group(1)}{key}{m.group(3)}{new_val}{m.group(5) or os.linesep}")
+        else:
+            new_lines.append(line)
+
+    if pending:
+        if new_lines and not new_lines[-1].endswith("\n"):
+            new_lines[-1] = new_lines[-1] + os.linesep
+        for k, v in pending.items():
+            new_lines.append(f"{k} = {v}{os.linesep}")
+
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        f.writelines(new_lines)
+
+
+def _format_ini_value(v):
+    """让 json 里的数字按 config.ini 习惯写出来（去掉冗余的 .0）。"""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v)
+
+
 def _prepare_mtf_runtime(package_dir, output_dir):
-    # 只复制 exe/config 到 output 目录，不修改 config.ini 内容。
+    """复制 exe/config 到工作目录，并按 thresholds.json 应用 config 覆盖。"""
     src_exe = os.path.join(package_dir, "mtf.exe")
     src_cfg = os.path.join(package_dir, "config.ini")
     dst_exe = os.path.join(output_dir, "mtf.exe")
     dst_cfg = os.path.join(output_dir, "config.ini")
     shutil.copyfile(src_exe, dst_exe)
     shutil.copyfile(src_cfg, dst_cfg)
+    _apply_mtf_config_overrides(dst_cfg)
 
 
 class TiltChecker:
@@ -883,6 +967,7 @@ _PANEL_WIDTH = 540
 _PANEL_SEP_WIDTH = 2
 _LEFT_WIDTH = _OUTPUT_WIDTH - _PANEL_WIDTH - _PANEL_SEP_WIDTH
 _HEADER_HEIGHT = 48
+_INNER_SEP_WIDTH = 18  # MTF / Tilt 两张子图之间的视觉分隔条宽度
 
 
 def _compose_combined_image(mtf_img, tilt_img, sections=None, overall_pass=False):
@@ -897,24 +982,37 @@ def _compose_combined_image(mtf_img, tilt_img, sections=None, overall_pass=False
     # 没有 sections 时整张图就是 left 区域，把 left 区域宽度撑满到 _OUTPUT_WIDTH。
     left_width = _LEFT_WIDTH if sections else _OUTPUT_WIDTH
 
-    # 按面积/宽高比把 left_width 分给 MTF 和 Tilt：选一个共同高度 H，使
-    # mtf_w + tilt_w == left_width。
+    # 按面积/宽高比把 left_width（去掉中间分隔条）分给 MTF 和 Tilt。
+    inner_sep = _INNER_SEP_WIDTH
+    usable_w = max(left_width - inner_sep, 2)
     mw, mh = int(mtf_bgr.shape[1]), int(mtf_bgr.shape[0])
     tw, th = int(tilt_bgr.shape[1]), int(tilt_bgr.shape[0])
     ratio_sum = (mw / max(mh, 1)) + (tw / max(th, 1))
-    body_h = max(int(round(left_width / max(ratio_sum, 1e-6))), 1)
+    body_h = max(int(round(usable_w / max(ratio_sum, 1e-6))), 1)
     mtf_w = max(int(round(mw * body_h / max(mh, 1))), 1)
-    mtf_w = min(mtf_w, left_width - 1)
-    tilt_w = left_width - mtf_w
+    mtf_w = min(mtf_w, usable_w - 1)
+    tilt_w = usable_w - mtf_w
 
     mtf_show = cv2.resize(mtf_bgr, (mtf_w, body_h), interpolation=cv2.INTER_AREA)
     tilt_show = cv2.resize(tilt_bgr, (tilt_w, body_h), interpolation=cv2.INTER_AREA)
-    body = np.hstack([mtf_show, tilt_show])
+    inner_sep_strip = np.full((body_h, inner_sep, 3), 24, dtype=np.uint8)
+    cv2.line(
+        inner_sep_strip,
+        (inner_sep // 2, 0), (inner_sep // 2, body_h - 1),
+        (95, 95, 95), 1, cv2.LINE_AA,
+    )
+    body = np.hstack([mtf_show, inner_sep_strip, tilt_show])
 
     header = np.zeros((_HEADER_HEIGHT, left_width, 3), dtype=np.uint8)
     _put_text(header, "清晰度 (MTF)", (12, 32), (255, 255, 255), size=22, bold=True)
-    _put_text(header, "倾斜 (TILT)", (mtf_w + 12, 32),
+    _put_text(header, "倾斜 (TILT)", (mtf_w + inner_sep + 12, 32),
               (255, 255, 255), size=22, bold=True)
+    # header 底部加一道与子图分隔条对齐的小竖纹，视觉上更整齐
+    cv2.line(
+        header,
+        (mtf_w + inner_sep // 2, 6), (mtf_w + inner_sep // 2, _HEADER_HEIGHT - 6),
+        (95, 95, 95), 1, cv2.LINE_AA,
+    )
     left = np.vstack([header, body])
 
     if not sections:
@@ -1002,7 +1100,7 @@ def run_all_checks(tof_raw_path):
             tmp_mtf_bmp_path_alt = os.path.join(abs_tmp_dir, "output", "output.bmp")
             mtf_img = cv2.imread(tmp_mtf_bmp_path_alt, cv2.IMREAD_UNCHANGED)
 
-        # 基于 pgm 的整图亮度统计：光源检测 + 脏污检测
+        # 基于 pgm 的整图亮度统计：光源亮度 + 脏污检测
         img_items, bright_mean, dirt_mean, bright_ok, dirt_ok = _check_image_stats(tmp_pgm_path)
 
         tilt_pass, tilt_values, tilt_img, tilt_reason, tilt_items = _run_tilt_from_pgm(
