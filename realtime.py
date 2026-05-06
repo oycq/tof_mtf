@@ -179,45 +179,24 @@ def tof_histograms_from_u16(raw_u16: np.ndarray) -> np.ndarray:
     return data[:expected].reshape((TOF_H, TOF_W, TOF_C)).astype(np.uint16, copy=False)
 
 
-def _to_bgr(img: np.ndarray | None, fallback_h: int = 300, fallback_w: int = 400) -> np.ndarray:
-    if img is None:
-        return np.zeros((fallback_h, fallback_w, 3), dtype=np.uint8)
-    arr = np.asarray(img)
-    if arr.ndim == 2:
-        return cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
-    if arr.ndim == 3 and arr.shape[2] == 3:
-        return arr
-    return np.zeros((fallback_h, fallback_w, 3), dtype=np.uint8)
+def _placeholder_view(h: int = 344, w: int = 800) -> np.ndarray:
+    return np.zeros((h, w, 3), dtype=np.uint8)
 
 
-def _compose_view(mtf_img: np.ndarray | None, tilt_img: np.ndarray | None, rec_on: bool) -> np.ndarray:
-    mtf_bgr = _to_bgr(mtf_img)
-    tilt_bgr = _to_bgr(tilt_img)
-
-    target_h = max(int(mtf_bgr.shape[0]), int(tilt_bgr.shape[0]), 1)
-    mtf_w = max(int(round(mtf_bgr.shape[1] * target_h / max(mtf_bgr.shape[0], 1))), 1)
-    tilt_w = max(int(round(tilt_bgr.shape[1] * target_h / max(tilt_bgr.shape[0], 1))), 1)
-    mtf_show = cv2.resize(mtf_bgr, (mtf_w, target_h), interpolation=cv2.INTER_NEAREST)
-    tilt_show = cv2.resize(tilt_bgr, (tilt_w, target_h), interpolation=cv2.INTER_NEAREST)
-
-    body = np.hstack([mtf_show, tilt_show])
-    header_h = 44
-    header = np.zeros((header_h, body.shape[1], 3), dtype=np.uint8)
-    cv2.putText(header, "MTF", (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1, cv2.LINE_AA)
-    cv2.putText(header, "TILT", (mtf_show.shape[1] + 10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1, cv2.LINE_AA)
-    if rec_on:
-        cv2.circle(header, (body.shape[1] - 24, 22), 7, (0, 0, 255), -1, cv2.LINE_AA)
-        cv2.putText(
-            header,
-            "REC",
-            (body.shape[1] - 72, 27),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.56,
-            (0, 0, 255),
-            2,
-            cv2.LINE_AA,
-        )
-    return np.vstack([header, body])
+def _overlay_rec(view: np.ndarray) -> np.ndarray:
+    out = view.copy()
+    cv2.circle(out, (out.shape[1] - 24, 22), 7, (0, 0, 255), -1, cv2.LINE_AA)
+    cv2.putText(
+        out,
+        "REC",
+        (out.shape[1] - 72, 27),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.56,
+        (0, 0, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    return out
 
 
 def main() -> int:
@@ -230,12 +209,11 @@ def main() -> int:
     tof_srv.start()
 
     last_ts = 0.0
-    mtf_img_cache: np.ndarray | None = None
-    tilt_img_cache: np.ndarray | None = None
+    image_cache: np.ndarray | None = None
     latest_raw_bytes: bytes | None = None
     rec_writer: cv2.VideoWriter | None = None
     rec_path: Path | None = None
-    view_cache: np.ndarray = _compose_view(None, None, False)
+    view_cache: np.ndarray = _placeholder_view()
 
     try:
         while True:
@@ -244,18 +222,15 @@ def main() -> int:
                 try:
                     latest_raw_bytes = bytes(frame.raw_bytes)
                     TMP_CHECK_RAW_PATH.write_bytes(frame.raw_bytes)
-                    res = run_all_checks(str(TMP_CHECK_RAW_PATH))
-                    mtf_img = res["mtf"]["image"]
-                    tilt_img = res["tilt"]["image"]
-                    if mtf_img is not None:
-                        mtf_img_cache = mtf_img
-                    if tilt_img is not None:
-                        tilt_img_cache = tilt_img
+                    _passed, image, _params = run_all_checks(str(TMP_CHECK_RAW_PATH))
+                    if image is not None:
+                        image_cache = image
                 except Exception:
                     pass
                 last_ts = float(frame.ts)
 
-            view_cache = _compose_view(mtf_img_cache, tilt_img_cache, rec_writer is not None)
+            base_view = image_cache if image_cache is not None else _placeholder_view()
+            view_cache = _overlay_rec(base_view) if rec_writer is not None else base_view
             cv2.imshow(window_name, view_cache)
             if rec_writer is not None:
                 rec_writer.write(view_cache)

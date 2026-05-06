@@ -549,6 +549,40 @@ def _run_tilt_from_pgm(pgm_path, tilt_output_path):
     return checker.run_from_pgm(pgm_path, tilt_output_path)
 
 
+def _to_bgr(img, fallback_h=300, fallback_w=400):
+    if img is None:
+        return np.zeros((fallback_h, fallback_w, 3), dtype=np.uint8)
+    arr = np.asarray(img)
+    if arr.ndim == 2:
+        return cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
+    if arr.ndim == 3 and arr.shape[2] == 3:
+        return arr
+    return np.zeros((fallback_h, fallback_w, 3), dtype=np.uint8)
+
+
+def _compose_combined_image(mtf_img, tilt_img):
+    """把 MTF / Tilt 两张图横向拼接成单张图，附上 header 标签。"""
+    mtf_bgr = _to_bgr(mtf_img)
+    tilt_bgr = _to_bgr(tilt_img)
+
+    target_h = max(int(mtf_bgr.shape[0]), int(tilt_bgr.shape[0]), 1)
+    mtf_w = max(int(round(mtf_bgr.shape[1] * target_h / max(mtf_bgr.shape[0], 1))), 1)
+    tilt_w = max(int(round(tilt_bgr.shape[1] * target_h / max(tilt_bgr.shape[0], 1))), 1)
+    mtf_show = cv2.resize(mtf_bgr, (mtf_w, target_h), interpolation=cv2.INTER_NEAREST)
+    tilt_show = cv2.resize(tilt_bgr, (tilt_w, target_h), interpolation=cv2.INTER_NEAREST)
+
+    body = np.hstack([mtf_show, tilt_show])
+    header_h = 44
+    header = np.zeros((header_h, body.shape[1], 3), dtype=np.uint8)
+    cv2.putText(header, "MTF", (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(
+        header, "TILT",
+        (mtf_show.shape[1] + 10, 28),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1, cv2.LINE_AA,
+    )
+    return np.vstack([header, body])
+
+
 def run_all_checks(tof_raw_path):
     """
     输入 tof.raw 路径，输出 MTF + Tilt 全套检测结果。
@@ -565,21 +599,15 @@ def run_all_checks(tof_raw_path):
 
     返回
     ----
-    dict, 结构如下：
-        {
-            "mtf": {
-                "pass":  bool,           # 是否通过
-                "value": float|None,     # MTF 清晰度数值
-                "reason": str|list,      # 诊断信息（"GOOD" 或失败原因）
-                "image": numpy.ndarray,  # MTF 结果图（output.bmp）
-            },
-            "tilt": {
-                "pass":  bool,           # 是否通过
-                "values": list[float],   # [roll, pitch, yaw, tx, ty, tz]
-                "reason": str,           # 诊断信息（"GOOD" 或失败原因）
-                "image":  numpy.ndarray, # 倾斜结果图（tilt.bmp）
-            },
-        }
+    tuple ``(passed, image, params)``:
+        passed : bool
+            MTF 和 Tilt 是否同时通过。
+        image : numpy.ndarray
+            MTF 与 Tilt 横向拼接的结果图（带 header 标签）。
+        params : list[float]
+            7 个数值，依次是
+            ``[mtf_value, roll_deg, pitch_deg, yaw_deg, tx_mm, ty_mm, tz_mm]``。
+            缺失或失败时对应位置为 ``nan``。
     """
     original_cwd = os.getcwd()
     launch_cwd = original_cwd
@@ -626,19 +654,10 @@ def run_all_checks(tof_raw_path):
             tmp_pgm_path, tmp_tilt_bmp_path
         )
 
-        return {
-            "mtf": {
-                "pass": bool(mtf_pass),
-                "value": float(mtf_value) if mtf_value is not None else None,
-                "reason": mtf_reason,
-                "image": mtf_img,
-            },
-            "tilt": {
-                "pass": bool(tilt_pass),
-                "values": tilt_values,
-                "reason": tilt_reason,
-                "image": tilt_img,
-            },
-        }
+        passed = bool(mtf_pass) and bool(tilt_pass)
+        mtf_value_f = float(mtf_value) if mtf_value is not None else float("nan")
+        params = [mtf_value_f] + [float(v) for v in tilt_values]
+        image = _compose_combined_image(mtf_img, tilt_img)
+        return passed, image, params
     finally:
         os.chdir(original_cwd)

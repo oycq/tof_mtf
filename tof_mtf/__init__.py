@@ -11,7 +11,10 @@ tof_mtf
 
     # tof.raw 路径相对于"调用时 Python 的当前工作目录"
     # 所有中间产物会落到 tof_mtf/tmp/ 内，不污染调用方目录
-    result = run_all_checks("tof.raw")
+    passed, image, params = run_all_checks("tof.raw")
+    # passed : bool
+    # image  : numpy.ndarray，MTF + Tilt 拼接图
+    # params : [mtf_value, roll, pitch, yaw, tx, ty, tz]
 
 返回结构详见 :func:`run_all_checks`。
 """
