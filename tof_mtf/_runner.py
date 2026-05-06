@@ -5,6 +5,7 @@ import subprocess
 
 import cv2
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 
 
 RAW_ROWS = 30
@@ -59,7 +60,7 @@ def _convert_raw_to_pgm(raw_path, pgm_path):
         raise RuntimeError(f"写入pgm失败: {pgm_path}")
 
 
-_MTF_ITEM_NAMES = ("MTF Run", "MTF Parse", "Light Panel", "MTF Boxes", "MTF Clarity")
+_MTF_ITEM_NAMES = ("MTF 运行", "MTF 解析", "光源亮度", "MTF 角块数", "MTF 清晰度")
 
 
 def _mk_item(name, status, measured, threshold, note=""):
@@ -94,14 +95,14 @@ def _check_mtf_with_exe(mtf_exe_path, work_dir):
             check=False,
         )
     except Exception as e:
-        items.append(_mk_item("MTF Run", "FAIL", "exec err", "exec ok", str(e)))
-        _skip_rest(1, "mtf.exe exec failed")
+        items.append(_mk_item("MTF 运行", "FAIL", "执行失败", "正常执行", str(e)))
+        _skip_rest(1, "mtf.exe 执行失败")
         os.chdir(old_cwd)
         return 0, 0.0, f"failed to run mtf.exe: {e}", items
     finally:
         os.chdir(old_cwd)
 
-    items.append(_mk_item("MTF Run", "PASS", "exec ok", "exec ok"))
+    items.append(_mk_item("MTF 运行", "PASS", "正常", "正常执行"))
 
     output = (result.stdout or "") + "\n" + (result.stderr or "")
 
@@ -114,24 +115,24 @@ def _check_mtf_with_exe(mtf_exe_path, work_dir):
             clarity_value = None
 
     if clarity_value is None:
-        items.append(_mk_item("MTF Parse", "FAIL", "no value", "value found", "regex no match"))
-        _skip_rest(2, "value not parsed")
+        items.append(_mk_item("MTF 解析", "FAIL", "未解析到", "成功解析", "value 正则未匹配"))
+        _skip_rest(2, "未解析到 value")
         return 0, 0.0, "clarity value not found in mtf output", items
 
-    items.append(_mk_item("MTF Parse", "PASS", f"{clarity_value:.4f}", "value found"))
+    items.append(_mk_item("MTF 解析", "PASS", f"{clarity_value:.4f}", "成功解析"))
 
     if "The light panel is too bright" in output:
-        items.append(_mk_item("Light Panel", "FAIL", "too bright", "not over", "panel over-exposed"))
-        _skip_rest(3, "light panel too bright")
+        items.append(_mk_item("光源亮度", "FAIL", "过亮", "未过曝", "光板过曝"))
+        _skip_rest(3, "光源过亮")
         return 0, clarity_value, "The light panel is too bright", items
 
-    items.append(_mk_item("Light Panel", "PASS", "normal", "not over"))
+    items.append(_mk_item("光源亮度", "PASS", "正常", "未过曝"))
 
     if "clarity is GOOD!" in output:
         n_match = re.search(r"n\s*=\s*([0-9]+)", output)
-        n_str = f"n={int(n_match.group(1))}" if n_match else "ok"
-        items.append(_mk_item("MTF Boxes", "PASS", n_str, "> threshold"))
-        items.append(_mk_item("MTF Clarity", "PASS", f"{clarity_value:.4f}", "> threshold"))
+        n_str = f"n={int(n_match.group(1))}" if n_match else "正常"
+        items.append(_mk_item("MTF 角块数", "PASS", n_str, "> 阈值"))
+        items.append(_mk_item("MTF 清晰度", "PASS", f"{clarity_value:.4f}", "> 阈值"))
         return 1, clarity_value, "GOOD", items
 
     cond_match = re.search(
@@ -140,8 +141,8 @@ def _check_mtf_with_exe(mtf_exe_path, work_dir):
         re.IGNORECASE,
     )
     if not cond_match:
-        items.append(_mk_item("MTF Boxes", "FAIL", "?", "?", "cond line missing"))
-        items.append(_mk_item("MTF Clarity", "FAIL", "?", "?", "cond line missing"))
+        items.append(_mk_item("MTF 角块数", "FAIL", "?", "?", "条件行缺失"))
+        items.append(_mk_item("MTF 清晰度", "FAIL", "?", "?", "条件行缺失"))
         return 0, clarity_value, "condition line not found: n = ... value = ...", items
 
     n_actual = int(cond_match.group(2))
@@ -151,10 +152,10 @@ def _check_mtf_with_exe(mtf_exe_path, work_dir):
 
     failed_reasons = []
     if n_actual > n_threshold:
-        items.append(_mk_item("MTF Boxes", "PASS", f"n={n_actual}", f"> {n_threshold}"))
+        items.append(_mk_item("MTF 角块数", "PASS", f"n={n_actual}", f"> {n_threshold}"))
     else:
         items.append(_mk_item(
-            "MTF Boxes", "FAIL", f"n={n_actual}", f"> {n_threshold}", "too few sharp boxes"
+            "MTF 角块数", "FAIL", f"n={n_actual}", f"> {n_threshold}", "清晰角块不足"
         ))
         failed_reasons.append(
             f"required at least {n_threshold + 1} MTF boxes, actual {n_actual}"
@@ -162,11 +163,11 @@ def _check_mtf_with_exe(mtf_exe_path, work_dir):
 
     if value_actual > value_threshold:
         items.append(_mk_item(
-            "MTF Clarity", "PASS", f"{value_actual:.4f}", f"> {value_threshold:.2f}"
+            "MTF 清晰度", "PASS", f"{value_actual:.4f}", f"> {value_threshold:.2f}"
         ))
     else:
         items.append(_mk_item(
-            "MTF Clarity", "FAIL", f"{value_actual:.4f}", f"> {value_threshold:.2f}", "below threshold"
+            "MTF 清晰度", "FAIL", f"{value_actual:.4f}", f"> {value_threshold:.2f}", "低于阈值"
         ))
         failed_reasons.append(
             f"mtf value {value_actual:.4f} below threshold: {value_threshold:.2f}"
@@ -238,14 +239,14 @@ class TiltChecker:
             )
             cv2.imwrite(tilt_output_path, fallback)
             items = [
-                _mk_item("Corners", "SKIP", "-", "-", f"tilt exception: {e}"),
-                _mk_item("PnP Solve", "SKIP", "-", "-", "tilt exception"),
-                _mk_item("Roll", "SKIP", "-", f"|x| <= {self.angle_abs_deg_max:.1f}", "tilt exception"),
-                _mk_item("Pitch", "SKIP", "-", f"|x| <= {self.angle_abs_deg_max:.1f}", "tilt exception"),
-                _mk_item("Yaw", "SKIP", "-", f"|x| <= {self.angle_abs_deg_max:.1f}", "tilt exception"),
-                _mk_item("Tx", "SKIP", "-", f"|x| <= {self.xy_abs_mm_max:.1f}", "tilt exception"),
-                _mk_item("Ty", "SKIP", "-", f"|x| <= {self.xy_abs_mm_max:.1f}", "tilt exception"),
-                _mk_item("Tz", "SKIP", "-", f"[{int(self.z_mm_min)}, {int(self.z_mm_max)}]", "tilt exception"),
+                _mk_item("角点检测", "SKIP", "-", "-", f"倾斜异常: {e}"),
+                _mk_item("姿态求解", "SKIP", "-", "-", "倾斜异常"),
+                _mk_item("横滚 Roll", "SKIP", "-", f"|x| <= {self.angle_abs_deg_max:.1f}", "倾斜异常"),
+                _mk_item("俯仰 Pitch", "SKIP", "-", f"|x| <= {self.angle_abs_deg_max:.1f}", "倾斜异常"),
+                _mk_item("偏航 Yaw", "SKIP", "-", f"|x| <= {self.angle_abs_deg_max:.1f}", "倾斜异常"),
+                _mk_item("X 偏移 Tx", "SKIP", "-", f"|x| <= {self.xy_abs_mm_max:.1f}", "倾斜异常"),
+                _mk_item("Y 偏移 Ty", "SKIP", "-", f"|x| <= {self.xy_abs_mm_max:.1f}", "倾斜异常"),
+                _mk_item("Z 距离 Tz", "SKIP", "-", f"[{int(self.z_mm_min)}, {int(self.z_mm_max)}]", "倾斜异常"),
             ]
             return False, self.nan_values, fallback, f"tilt exception: {e}", items
 
@@ -496,28 +497,28 @@ class TiltChecker:
 
         def _skip_pose():
             for nm, thr in (
-                ("Roll", angle_thr_str), ("Pitch", angle_thr_str), ("Yaw", angle_thr_str),
-                ("Tx", xy_thr_str), ("Ty", xy_thr_str), ("Tz", z_thr_str),
+                ("横滚 Roll", angle_thr_str), ("俯仰 Pitch", angle_thr_str), ("偏航 Yaw", angle_thr_str),
+                ("X 偏移 Tx", xy_thr_str), ("Y 偏移 Ty", xy_thr_str), ("Z 距离 Tz", z_thr_str),
             ):
-                items.append(_mk_item(nm, "SKIP", "-", thr, "no pose"))
+                items.append(_mk_item(nm, "SKIP", "-", thr, "无姿态"))
 
         detected_points = sum(1 for _n, _r, _i, p in results if p is not None)
         if detected_points < 4:
             items.append(_mk_item(
-                "Corners", "FAIL", f"{detected_points}/4", "== 4", "missing corners"
+                "角点检测", "FAIL", f"{detected_points}/4", "== 4", "角点缺失"
             ))
-            items.append(_mk_item("PnP Solve", "SKIP", "-", "ok", "no corners"))
+            items.append(_mk_item("姿态求解", "SKIP", "-", "成功", "无角点"))
             _skip_pose()
             return False, self.nan_values, (
                 f"tilt corner extraction failed: need 4 points, got {detected_points}"
             ), items
-        items.append(_mk_item("Corners", "PASS", f"{detected_points}/4", "== 4"))
+        items.append(_mk_item("角点检测", "PASS", f"{detected_points}/4", "== 4"))
 
         if pose is None:
-            items.append(_mk_item("PnP Solve", "FAIL", "failed", "ok", "solvePnP returned False"))
+            items.append(_mk_item("姿态求解", "FAIL", "失败", "成功", "solvePnP 返回 False"))
             _skip_pose()
             return False, self.nan_values, "tilt pnp failed", items
-        items.append(_mk_item("PnP Solve", "PASS", "solved", "ok"))
+        items.append(_mk_item("姿态求解", "PASS", "成功", "成功"))
 
         roll_deg = float(pose["roll_deg"])
         pitch_deg = float(pose["pitch_deg"])
@@ -534,7 +535,7 @@ class TiltChecker:
                 "PASS" if ok else "FAIL",
                 f"{val:+.2f} {unit}",
                 f"|x| <= {limit:.1f}",
-                "" if ok else "out of range",
+                "" if ok else "超出范围",
             ))
             return ok
 
@@ -545,16 +546,16 @@ class TiltChecker:
                 "PASS" if ok else "FAIL",
                 f"{val:.2f} {unit}",
                 f"[{int(lo)}, {int(hi)}]",
-                "" if ok else "out of range",
+                "" if ok else "超出范围",
             ))
             return ok
 
-        ok_roll = _abs_check("Roll", roll_deg, angle_thr, "deg")
-        ok_pitch = _abs_check("Pitch", pitch_deg, angle_thr, "deg")
-        ok_yaw = _abs_check("Yaw", yaw_deg, angle_thr, "deg")
-        ok_tx = _abs_check("Tx", tx_mm, xy_thr, "mm")
-        ok_ty = _abs_check("Ty", ty_mm, xy_thr, "mm")
-        ok_tz = _range_check("Tz", tz_mm, z_lo, z_hi, "mm")
+        ok_roll = _abs_check("横滚 Roll", roll_deg, angle_thr, "deg")
+        ok_pitch = _abs_check("俯仰 Pitch", pitch_deg, angle_thr, "deg")
+        ok_yaw = _abs_check("偏航 Yaw", yaw_deg, angle_thr, "deg")
+        ok_tx = _abs_check("X 偏移 Tx", tx_mm, xy_thr, "mm")
+        ok_ty = _abs_check("Y 偏移 Ty", ty_mm, xy_thr, "mm")
+        ok_tz = _range_check("Z 距离 Tz", tz_mm, z_lo, z_hi, "mm")
 
         passed = ok_roll and ok_pitch and ok_yaw and ok_tx and ok_ty and ok_tz
         if passed:
@@ -656,92 +657,159 @@ def _to_bgr(img, fallback_h=300, fallback_w=400):
 
 
 _STATUS_COLORS = {
-    "PASS": (60, 200, 60),    # green
+    "PASS": (60, 200, 60),    # green (BGR)
     "FAIL": (60, 80, 230),    # red
     "SKIP": (160, 160, 160),  # gray
 }
 
+_STATUS_TEXT_CN = {"PASS": "通过", "FAIL": "失败", "SKIP": "跳过"}
 
-def _put_text(img, text, org, color, scale=0.5, thickness=1, align="left"):
-    (tw, _th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
+_FONT_CANDIDATES = (
+    r"C:\Windows\Fonts\msyh.ttc",
+    r"C:\Windows\Fonts\msyhbd.ttc",
+    r"C:\Windows\Fonts\simhei.ttf",
+    r"/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+    r"/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    r"/System/Library/Fonts/PingFang.ttc",
+)
+_FONT_BOLD_CANDIDATES = (
+    r"C:\Windows\Fonts\msyhbd.ttc",
+    r"C:\Windows\Fonts\msyh.ttc",
+    r"C:\Windows\Fonts\simhei.ttf",
+)
+_FONT_PATH = next((p for p in _FONT_CANDIDATES if os.path.exists(p)), None)
+_FONT_PATH_BOLD = next((p for p in _FONT_BOLD_CANDIDATES if os.path.exists(p)), _FONT_PATH)
+_FONT_CACHE = {}
+
+
+def _get_font(size, bold=False):
+    key = (size, bool(bold))
+    if key in _FONT_CACHE:
+        return _FONT_CACHE[key]
+    path = _FONT_PATH_BOLD if bold else _FONT_PATH
+    if path is None:
+        font = ImageFont.load_default()
+    else:
+        try:
+            font = ImageFont.truetype(path, size)
+        except Exception:
+            font = ImageFont.load_default()
+    _FONT_CACHE[key] = font
+    return font
+
+
+def _put_text(img, text, org, color, size=16, bold=False, align="left"):
+    """在 OpenCV BGR 图像上绘制（支持中文）。
+
+    org 给的是基线/锚点坐标：左对齐时是文字左上角附近，右对齐时是右上角附近。
+    """
+    font = _get_font(size, bold=bold)
+    pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(pil)
+    bbox = draw.textbbox((0, 0), text, font=font)
+    tw = bbox[2] - bbox[0]
+    th = bbox[3] - bbox[1]
     x, y = org
     if align == "right":
         x = x - tw
     elif align == "center":
         x = x - tw // 2
-    cv2.putText(img, text, (int(x), int(y)), cv2.FONT_HERSHEY_SIMPLEX,
-                scale, color, thickness, cv2.LINE_AA)
+    # 把"基线 y"换成 PIL 的左上 y：让文字垂直高度正好放在 org 的 y 上方一点
+    y_top = int(y) - th
+    draw.text((int(x), y_top), text, font=font, fill=(int(color[2]), int(color[1]), int(color[0])))
+    img[:] = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
 
 
 def _draw_test_panel(items, overall_pass):
-    """绘制产测项目面板（可贴在主图右侧）。"""
-    panel_w = 500
-    pad_x = 14
-    title_h = 44
-    line_h = 22
+    """绘制产测项目面板（可贴在主图右侧），宽度固定为 _PANEL_WIDTH。"""
+    panel_w = _PANEL_WIDTH
+    pad_x = 16
+    title_h = 50
+    line_h = 26
     sep_h = 1
     n_items = len(items)
-    panel_h = title_h + sep_h + n_items * line_h + 14
+    panel_h = title_h + sep_h + n_items * line_h + 18
 
-    panel = np.full((panel_h, panel_w, 3), 24, dtype=np.uint8)  # 暗灰底
+    panel = np.full((panel_h, panel_w, 3), 24, dtype=np.uint8)
 
     # 标题 & 总状态
-    title_y = 28
-    _put_text(panel, "TEST ITEMS", (pad_x, title_y), (235, 235, 235), scale=0.7, thickness=2)
-    overall_text = f"OVERALL: {'PASS' if overall_pass else 'FAIL'}"
+    title_y = 32
+    _put_text(panel, "产测项目", (pad_x, title_y), (235, 235, 235), size=22, bold=True)
+    overall_text = f"总判定: {'通过' if overall_pass else '失败'}"
     overall_color = _STATUS_COLORS["PASS" if overall_pass else "FAIL"]
     _put_text(panel, overall_text, (panel_w - pad_x, title_y),
-              overall_color, scale=0.7, thickness=2, align="right")
+              overall_color, size=22, bold=True, align="right")
 
     # 分隔线
     sep_y = title_h
     cv2.line(panel, (pad_x, sep_y), (panel_w - pad_x, sep_y), (90, 90, 90), 1)
 
-    # 列 x 位置（左对齐 name / 右对齐 measured / 左对齐 threshold / 右对齐 status）
+    # 列 x 位置：name / measured(右) / threshold(左) / status(右)
     col_name_x = pad_x
-    col_measured_right = 230
-    col_threshold_x = 250
+    col_measured_right = 240
+    col_threshold_x = 258
     col_status_right = panel_w - pad_x
 
-    y = sep_y + line_h - 4
+    y = sep_y + line_h
     for it in items:
         color = _STATUS_COLORS.get(it["status"], (220, 220, 220))
-        _put_text(panel, it["name"], (col_name_x, y), color, scale=0.5, thickness=1)
+        status_cn = _STATUS_TEXT_CN.get(it["status"], it["status"])
+        _put_text(panel, it["name"], (col_name_x, y), color, size=15)
         _put_text(panel, it["measured"], (col_measured_right, y),
-                  color, scale=0.5, thickness=1, align="right")
+                  color, size=15, align="right")
         _put_text(panel, it["threshold"], (col_threshold_x, y),
-                  (210, 210, 210), scale=0.5, thickness=1)
-        _put_text(panel, f"[{it['status']}]", (col_status_right, y),
-                  color, scale=0.55, thickness=2, align="right")
+                  (210, 210, 210), size=15)
+        _put_text(panel, f"[{status_cn}]", (col_status_right, y),
+                  color, size=16, bold=True, align="right")
         y += line_h
 
     return panel
 
 
+_OUTPUT_WIDTH = 1600
+_PANEL_WIDTH = 540
+_PANEL_SEP_WIDTH = 2
+_LEFT_WIDTH = _OUTPUT_WIDTH - _PANEL_WIDTH - _PANEL_SEP_WIDTH
+_HEADER_HEIGHT = 48
+
+
 def _compose_combined_image(mtf_img, tilt_img, items=None, overall_pass=False):
-    """把 MTF / Tilt 两张图横向拼接，并在右侧贴上产测项目面板。"""
+    """把 MTF / Tilt 两张图横向拼接，并在右侧贴上产测项目面板。
+
+    输出宽度固定为 ``_OUTPUT_WIDTH``。所有文字都直接在最终画布上原生绘制，
+    不会被任何后续 resize 拖拽，避免出现"先小尺寸贴字、再放大变糊"的问题。
+    """
     mtf_bgr = _to_bgr(mtf_img)
     tilt_bgr = _to_bgr(tilt_img)
 
-    target_h = max(int(mtf_bgr.shape[0]), int(tilt_bgr.shape[0]), 1)
-    mtf_w = max(int(round(mtf_bgr.shape[1] * target_h / max(mtf_bgr.shape[0], 1))), 1)
-    tilt_w = max(int(round(tilt_bgr.shape[1] * target_h / max(tilt_bgr.shape[0], 1))), 1)
-    mtf_show = cv2.resize(mtf_bgr, (mtf_w, target_h), interpolation=cv2.INTER_NEAREST)
-    tilt_show = cv2.resize(tilt_bgr, (tilt_w, target_h), interpolation=cv2.INTER_NEAREST)
+    # 没有 items 时整张图就是 left 区域，把 left 区域宽度撑满到 _OUTPUT_WIDTH。
+    left_width = _LEFT_WIDTH if items else _OUTPUT_WIDTH
 
+    # 按面积/宽高比把 left_width 分给 MTF 和 Tilt：选一个共同高度 H，使
+    # mtf_w + tilt_w == left_width。
+    mw, mh = int(mtf_bgr.shape[1]), int(mtf_bgr.shape[0])
+    tw, th = int(tilt_bgr.shape[1]), int(tilt_bgr.shape[0])
+    ratio_sum = (mw / max(mh, 1)) + (tw / max(th, 1))
+    body_h = max(int(round(left_width / max(ratio_sum, 1e-6))), 1)
+    mtf_w = max(int(round(mw * body_h / max(mh, 1))), 1)
+    mtf_w = min(mtf_w, left_width - 1)
+    tilt_w = left_width - mtf_w
+
+    mtf_show = cv2.resize(mtf_bgr, (mtf_w, body_h), interpolation=cv2.INTER_AREA)
+    tilt_show = cv2.resize(tilt_bgr, (tilt_w, body_h), interpolation=cv2.INTER_AREA)
     body = np.hstack([mtf_show, tilt_show])
-    header_h = 44
-    header = np.zeros((header_h, body.shape[1], 3), dtype=np.uint8)
-    _put_text(header, "MTF", (10, 28), (255, 255, 255), scale=0.7, thickness=2)
-    _put_text(header, "TILT", (mtf_show.shape[1] + 10, 28),
-              (255, 255, 255), scale=0.7, thickness=2)
+
+    header = np.zeros((_HEADER_HEIGHT, left_width, 3), dtype=np.uint8)
+    _put_text(header, "清晰度 (MTF)", (12, 32), (255, 255, 255), size=22, bold=True)
+    _put_text(header, "倾斜 (TILT)", (mtf_w + 12, 32),
+              (255, 255, 255), size=22, bold=True)
     left = np.vstack([header, body])
 
     if not items:
         return left
 
     panel = _draw_test_panel(items, overall_pass)
-    # 高度对齐（不足部分用相同底色补齐）
+    # 高度对齐（不足部分用相同底色补齐），文字已经原生贴好，不会被再缩放。
     out_h = max(left.shape[0], panel.shape[0])
     if left.shape[0] < out_h:
         pad = np.zeros((out_h - left.shape[0], left.shape[1], 3), dtype=np.uint8)
@@ -750,7 +818,7 @@ def _compose_combined_image(mtf_img, tilt_img, items=None, overall_pass=False):
         pad = np.full((out_h - panel.shape[0], panel.shape[1], 3), 24, dtype=np.uint8)
         panel = np.vstack([panel, pad])
 
-    sep = np.full((out_h, 2, 3), 70, dtype=np.uint8)
+    sep = np.full((out_h, _PANEL_SEP_WIDTH, 3), 70, dtype=np.uint8)
     return np.hstack([left, sep, panel])
 
 
