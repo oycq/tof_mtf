@@ -1,16 +1,16 @@
 {
   "mtf": {
-    "mtf_throat": 0.50
+    "mtf_throat": 0.60
   },
   "tilt": {
     "angle_abs_deg_max": 10.0,
     "xy_abs_mm_max": 20.0,
-    "z_mm_min": 380.0,
-    "z_mm_max": 420.0
+    "z_mm_min": 375.0,
+    "z_mm_max": 425.0
   },
   "dirty": {
-    "bright_top_mean_min": 80.0,
-    "bright_top_mean_max": 240.0,
+    "bright_top_mean_min": 140.0,
+    "bright_top_mean_max": 170.0,
     "dark_bottom_mean_max": 30.0
   }
 }
