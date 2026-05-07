@@ -6,22 +6,17 @@
 - 清晰度(MTF)
 - 倾斜(Tilt)
 
-界面只显示两张图：
-- MTF output.bmp
-- Tilt output.bmp
+单线程主循环：trigger -> pull -> check -> 显示。
+所有外部子进程超时统一为 0.3 秒，任何一步超时/失败都丢这帧继续下一帧。
 """
 
 from __future__ import annotations
 
 import subprocess
-import threading
 import time
 import traceback
-from collections import deque
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Deque, Optional
 
 import cv2
 import numpy as np
@@ -33,183 +28,15 @@ TOF_H = 30
 TOF_W = 40
 TOF_C = 64
 TOF_RAW_HEADER_BYTES = 5120
+RAW_EXPECTED_BYTES = TOF_RAW_HEADER_BYTES + TOF_H * TOF_W * TOF_C * 2
 
-TARGET_FPS = 10.0
-ADB_PULL_TIMEOUT_S = 0.9
+STEP_TIMEOUT_S = 0.3
 
 TMP_DIR = Path("./tmp")
 TMP_PULL_RAW_PATH = TMP_DIR / "tof_pull.raw"
 TMP_CHECK_RAW_PATH = TMP_DIR / "realtime_check.raw"
 REC_DIR = TMP_DIR
 REC_FPS = 20.0
-
-
-@dataclass(frozen=True)
-class ToFFrame:
-    ts: float
-    raw_bytes: bytes
-
-
-class ToFRealtimeServer:
-    def __init__(
-        self,
-        *,
-        queue_maxlen: int = 3,
-        min_peak_count: float = 100.0,
-        target_fps: float = TARGET_FPS,
-        raw_expected_bytes: int | None = None,
-        read_retry: int = 3,
-    ) -> None:
-        self._lock = threading.Lock()
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._q: Deque[ToFFrame] = deque(maxlen=int(max(queue_maxlen, 1)))
-        self._target_dt = 1.0 / float(max(target_fps, 1.0))
-        self._read_retry = int(max(read_retry, 0))
-        self._min_peak_count = float(max(min_peak_count, 0.0))
-        if raw_expected_bytes is None:
-            self._raw_expected_bytes = int(TOF_RAW_HEADER_BYTES + TOF_H * TOF_W * TOF_C * 2)
-        else:
-            self._raw_expected_bytes = int(raw_expected_bytes)
-
-    def start(self) -> None:
-        if self._thread is not None and self._thread.is_alive():
-            return
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._run, name="ToFRealtimeServerInline", daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop.set()
-        thread = self._thread
-        if thread is not None:
-            thread.join(timeout=0.8)
-        self._thread = None
-
-    def get_latest(self) -> Optional[ToFFrame]:
-        with self._lock:
-            return self._q[-1] if self._q else None
-
-    @staticmethod
-    def _adb_trigger_generate_raw() -> tuple[bool, str]:
-        cmd = "if [ -e /tmp/sv_tof ]; then rm /tmp/sv_tof && rm /tmp/tof.raw; fi && touch /tmp/sv_tof"
-        try:
-            r = subprocess.run(
-                ["adb", "shell", cmd],
-                timeout=0.6,
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
-            if int(r.returncode) == 0:
-                return True, ""
-            err = (r.stderr or b"").decode("utf-8", errors="ignore").strip()
-            return False, f"adb shell rc={r.returncode}: {err[:200]}"
-        except subprocess.TimeoutExpired:
-            return False, "adb shell timeout"
-        except Exception as e:
-            return False, f"adb shell exc: {e!r}"
-
-    @staticmethod
-    def _adb_pull_raw_bytes(*, expected_bytes: int, retry: int) -> tuple[bytes | None, str]:
-        expected = int(expected_bytes)
-        retr = int(max(retry, 0))
-        TMP_DIR.mkdir(parents=True, exist_ok=True)
-        last_err = ""
-        for k in range(retr + 1):
-            try:
-                if TMP_PULL_RAW_PATH.exists():
-                    TMP_PULL_RAW_PATH.unlink(missing_ok=True)
-                r = subprocess.run(
-                    ["adb", "pull", "/tmp/tof.raw", str(TMP_PULL_RAW_PATH)],
-                    timeout=float(ADB_PULL_TIMEOUT_S),
-                    check=False,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
-                )
-                if int(r.returncode) != 0:
-                    last_err = (r.stderr or b"").decode("utf-8", errors="ignore").strip() or f"rc={r.returncode}"
-                    if k < retr:
-                        time.sleep(0.01)
-                    continue
-                if not TMP_PULL_RAW_PATH.exists():
-                    last_err = "pulled file missing"
-                    if k < retr:
-                        time.sleep(0.01)
-                    continue
-                size = int(TMP_PULL_RAW_PATH.stat().st_size)
-                if size < expected:
-                    last_err = f"pulled too small: {size} < {expected}"
-                    if k < retr:
-                        time.sleep(0.01)
-                    continue
-                out = TMP_PULL_RAW_PATH.read_bytes()
-                if len(out) >= expected:
-                    return bytes(out[:expected]), ""
-            except subprocess.TimeoutExpired:
-                last_err = "adb pull timeout"
-            except Exception as e:
-                last_err = f"adb pull exc: {e!r}"
-            if k < retr:
-                time.sleep(0.01)
-        return None, last_err or "unknown pull error"
-
-    def _run(self) -> None:
-        fail_sleep = 0.15
-        last_log_ts = 0.0
-
-        def _throttle_log(msg: str) -> None:
-            nonlocal last_log_ts
-            now = time.time()
-            if now - last_log_ts > 2.0:
-                print(f"[realtime] {msg}", flush=True)
-                last_log_ts = now
-
-        while not self._stop.is_set():
-            ok, err = self._adb_trigger_generate_raw()
-            if not ok:
-                _throttle_log(f"trigger 失败: {err}")
-                time.sleep(fail_sleep)
-                continue
-            time.sleep(0.03)
-            t0 = time.perf_counter()
-            raw_bytes, err = self._adb_pull_raw_bytes(
-                expected_bytes=self._raw_expected_bytes, retry=self._read_retry
-            )
-            if not raw_bytes:
-                _throttle_log(f"pull 失败: {err}")
-                time.sleep(fail_sleep)
-                continue
-            if self._min_peak_count > 0.0:
-                raw_u16 = np.frombuffer(raw_bytes, dtype=np.uint16)
-                hists = tof_histograms_from_u16(raw_u16)
-                if hists.shape != (TOF_H, TOF_W, TOF_C):
-                    _throttle_log(f"histogram shape 异常: {hists.shape}")
-                    time.sleep(fail_sleep)
-                    continue
-                peak = float(np.max(hists[:, :, :62]))
-                if peak < self._min_peak_count:
-                    _throttle_log(f"信号过弱跳过: peak={peak:.1f} < min={self._min_peak_count:.1f}")
-                    time.sleep(fail_sleep)
-                    continue
-            frame = ToFFrame(ts=time.time(), raw_bytes=raw_bytes)
-            with self._lock:
-                self._q.append(frame)
-            dt = time.perf_counter() - t0
-            sleep = self._target_dt - dt
-            if sleep > 0:
-                time.sleep(min(sleep, 0.2))
-
-
-def tof_histograms_from_u16(raw_u16: np.ndarray) -> np.ndarray:
-    header_words = int(TOF_RAW_HEADER_BYTES // 2)
-    if raw_u16.size <= header_words:
-        return np.zeros((TOF_H, TOF_W, TOF_C), dtype=np.uint16)
-    data = raw_u16[header_words:]
-    expected = TOF_H * TOF_W * TOF_C
-    if data.size < expected:
-        return np.zeros((TOF_H, TOF_W, TOF_C), dtype=np.uint16)
-    return data[:expected].reshape((TOF_H, TOF_W, TOF_C)).astype(np.uint16, copy=False)
 
 
 def _placeholder_view(h: int = 344, w: int = 800) -> np.ndarray:
@@ -233,7 +60,6 @@ def _overlay_rec(view: np.ndarray) -> np.ndarray:
 
 
 def _check_adb_connected() -> bool:
-    """启动前自检：adb 能否拿到一台在线设备。失败直接返回 False。"""
     try:
         r = subprocess.run(
             ["adb", "devices"],
@@ -252,6 +78,61 @@ def _check_adb_connected() -> bool:
     return False
 
 
+def _adb_trigger() -> tuple[bool, str]:
+    cmd = "if [ -e /tmp/sv_tof ]; then rm /tmp/sv_tof && rm /tmp/tof.raw; fi && touch /tmp/sv_tof"
+    try:
+        r = subprocess.run(
+            ["adb", "shell", cmd],
+            timeout=STEP_TIMEOUT_S,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        if int(r.returncode) == 0:
+            return True, ""
+        err = (r.stderr or b"").decode("utf-8", errors="ignore").strip()
+        return False, f"adb shell rc={r.returncode}: {err[:200]}"
+    except subprocess.TimeoutExpired:
+        return False, "adb shell timeout"
+    except Exception as e:
+        return False, f"adb shell exc: {e!r}"
+
+
+def _adb_pull_raw() -> tuple[bytes | None, str]:
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        if TMP_PULL_RAW_PATH.exists():
+            TMP_PULL_RAW_PATH.unlink(missing_ok=True)
+        r = subprocess.run(
+            ["adb", "pull", "/tmp/tof.raw", str(TMP_PULL_RAW_PATH)],
+            timeout=STEP_TIMEOUT_S,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        if int(r.returncode) != 0:
+            err = (r.stderr or b"").decode("utf-8", errors="ignore").strip() or f"rc={r.returncode}"
+            return None, err
+        if not TMP_PULL_RAW_PATH.exists():
+            return None, "pulled file missing"
+        size = int(TMP_PULL_RAW_PATH.stat().st_size)
+        if size < RAW_EXPECTED_BYTES:
+            return None, f"pulled too small: {size} < {RAW_EXPECTED_BYTES}"
+        out = TMP_PULL_RAW_PATH.read_bytes()
+        return bytes(out[:RAW_EXPECTED_BYTES]), ""
+    except subprocess.TimeoutExpired:
+        return None, "adb pull timeout"
+    except Exception as e:
+        return None, f"adb pull exc: {e!r}"
+
+
+def _throttle_log(state: dict, msg: str) -> None:
+    now = time.time()
+    if now - state.get("last_log_ts", 0.0) > 2.0:
+        print(f"[realtime] {msg}", flush=True)
+        state["last_log_ts"] = now
+
+
 def main() -> int:
     if not _check_adb_connected():
         print("[realtime] adb 无法连接（请检查设备是否插好、是否授权）", flush=True)
@@ -262,29 +143,31 @@ def main() -> int:
 
     TMP_DIR.mkdir(parents=True, exist_ok=True)
 
-    tof_srv = ToFRealtimeServer(queue_maxlen=3, min_peak_count=0.0, target_fps=float(TARGET_FPS))
-    tof_srv.start()
-
-    last_ts = 0.0
     image_cache: np.ndarray | None = None
     latest_raw_bytes: bytes | None = None
     rec_writer: cv2.VideoWriter | None = None
     rec_path: Path | None = None
     view_cache: np.ndarray = _placeholder_view()
+    log_state: dict = {"last_log_ts": 0.0}
 
     try:
         while True:
-            frame = tof_srv.get_latest()
-            if frame is not None and float(frame.ts) > float(last_ts):
-                try:
-                    latest_raw_bytes = bytes(frame.raw_bytes)
-                    TMP_CHECK_RAW_PATH.write_bytes(frame.raw_bytes)
-                    _passed, image, _params = run_all_checks(str(TMP_CHECK_RAW_PATH))
-                    if image is not None:
-                        image_cache = image
-                except Exception:
-                    traceback.print_exc()
-                last_ts = float(frame.ts)
+            ok, err = _adb_trigger()
+            if ok:
+                raw_bytes, perr = _adb_pull_raw()
+                if raw_bytes is not None:
+                    latest_raw_bytes = raw_bytes
+                    try:
+                        TMP_CHECK_RAW_PATH.write_bytes(raw_bytes)
+                        _passed, image, _params = run_all_checks(str(TMP_CHECK_RAW_PATH))
+                        if image is not None:
+                            image_cache = image
+                    except Exception:
+                        traceback.print_exc()
+                else:
+                    _throttle_log(log_state, f"pull 失败: {perr}")
+            else:
+                _throttle_log(log_state, f"trigger 失败: {err}")
 
             base_view = image_cache if image_cache is not None else _placeholder_view()
             view_cache = _overlay_rec(base_view) if rec_writer is not None else base_view
@@ -332,7 +215,6 @@ def main() -> int:
     finally:
         if rec_writer is not None:
             rec_writer.release()
-        tof_srv.stop()
         cv2.destroyAllWindows()
 
     return 0

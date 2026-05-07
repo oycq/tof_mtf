@@ -132,7 +132,13 @@ def _check_mtf_with_exe(mtf_exe_path, work_dir):
             capture_output=True,
             text=True,
             check=False,
+            timeout=0.3,
         )
+    except subprocess.TimeoutExpired as e:
+        items.append(_mk_item("MTF 运行", "FAIL", "超时", "<= 0.3s", "mtf.exe 执行超时"))
+        _skip_rest(1, "mtf.exe 执行超时")
+        os.chdir(old_cwd)
+        return 0, 0.0, f"mtf.exe timeout: {e}", items
     except Exception as e:
         items.append(_mk_item("MTF 运行", "FAIL", "执行失败", "正常执行", str(e)))
         _skip_rest(1, "mtf.exe 执行失败")
